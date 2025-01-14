@@ -31,22 +31,27 @@ namespace orm
 {
 class MysqlConnection;
 using MysqlConnectionPtr = std::shared_ptr<MysqlConnection>;
+
 class MysqlConnection : public DbConnection,
                         public std::enable_shared_from_this<MysqlConnection>
 {
   public:
     MysqlConnection(trantor::EventLoop *loop, const std::string &connInfo);
+
+    void init() override;
+
     ~MysqlConnection()
     {
     }
-    virtual void execSql(string_view &&sql,
-                         size_t paraNum,
-                         std::vector<const char *> &&parameters,
-                         std::vector<int> &&length,
-                         std::vector<int> &&format,
-                         ResultCallback &&rcb,
-                         std::function<void(const std::exception_ptr &)>
-                             &&exceptCallback) override
+
+    void execSql(std::string_view &&sql,
+                 size_t paraNum,
+                 std::vector<const char *> &&parameters,
+                 std::vector<int> &&length,
+                 std::vector<int> &&format,
+                 ResultCallback &&rcb,
+                 std::function<void(const std::exception_ptr &)>
+                     &&exceptCallback) override
     {
         if (loop_->isInLoopThread())
         {
@@ -80,16 +85,46 @@ class MysqlConnection : public DbConnection,
                 });
         }
     }
-    virtual void batchSql(std::deque<std::shared_ptr<SqlCmd>> &&) override
+
+    void batchSql(std::deque<std::shared_ptr<SqlCmd>> &&) override
     {
         LOG_FATAL << "The mysql library does not support batch mode";
         exit(1);
     }
-    virtual void disconnect() override;
+
+    void disconnect() override;
 
   private:
+    class MysqlEnv
+    {
+      public:
+        MysqlEnv()
+        {
+            mysql_library_init(0, nullptr, nullptr);
+        }
+
+        ~MysqlEnv()
+        {
+            mysql_library_end();
+        }
+    };
+
+    class MysqlThreadEnv
+    {
+      public:
+        MysqlThreadEnv()
+        {
+            mysql_thread_init();
+        }
+
+        ~MysqlThreadEnv()
+        {
+            mysql_thread_end();
+        }
+    };
+
     void execSqlInLoop(
-        string_view &&sql,
+        std::string_view &&sql,
         size_t paraNum,
         std::vector<const char *> &&parameters,
         std::vector<int> &&length,
@@ -110,6 +145,7 @@ class MysqlConnection : public DbConnection,
     void startQuery();
     void startStoreResult(bool queueInLoop);
     int waitStatus_;
+    unsigned int reconnect_{1};
     enum class ExecStatus
     {
         None = 0,

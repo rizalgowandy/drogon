@@ -1,6 +1,12 @@
 #include <drogon/drogon.h>
-#include <iostream>
+
 #include <future>
+#include <iostream>
+
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#endif
 
 using namespace drogon;
 
@@ -11,6 +17,28 @@ int main()
     trantor::Logger::setLogLevel(trantor::Logger::kTrace);
     {
         auto client = HttpClient::newHttpClient("http://www.baidu.com");
+        client->setSockOptCallback([](int fd) {
+            std::cout << "setSockOptCallback:" << fd << std::endl;
+#ifdef __linux__
+            int optval = 10;
+            ::setsockopt(fd,
+                         SOL_TCP,
+                         TCP_KEEPCNT,
+                         &optval,
+                         static_cast<socklen_t>(sizeof optval));
+            ::setsockopt(fd,
+                         SOL_TCP,
+                         TCP_KEEPIDLE,
+                         &optval,
+                         static_cast<socklen_t>(sizeof optval));
+            ::setsockopt(fd,
+                         SOL_TCP,
+                         TCP_KEEPINTVL,
+                         &optval,
+                         static_cast<socklen_t>(sizeof optval));
+#endif
+        });
+
         auto req = HttpRequest::newHttpRequest();
         req->setMethod(drogon::Get);
         req->setPath("/s");
@@ -20,7 +48,15 @@ int main()
         for (int i = 0; i < 10; ++i)
         {
             client->sendRequest(
-                req, [](ReqResult, const HttpResponsePtr &response) {
+                req, [](ReqResult result, const HttpResponsePtr &response) {
+                    if (result != ReqResult::Ok)
+                    {
+                        std::cout
+                            << "error while sending request to server! result: "
+                            << result << std::endl;
+                        return;
+                    }
+
                     std::cout << "receive response!" << std::endl;
                     // auto headers=response.
                     ++nth_resp;
@@ -36,6 +72,8 @@ int main()
                     std::cout << "count=" << nth_resp << std::endl;
                 });
         }
+        std::cout << "requestsBufferSize:" << client->requestsBufferSize()
+                  << std::endl;
     }
 
     app().run();

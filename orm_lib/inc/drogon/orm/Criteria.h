@@ -26,6 +26,7 @@ namespace Json
 {
 class Value;
 }
+
 namespace drogon
 {
 namespace orm
@@ -39,10 +40,33 @@ enum class CompareOperator
     LT,
     LE,
     Like,
+    NotLike,
     In,
+    NotIn,
     IsNull,
     IsNotNull
 };
+
+/**
+ * @brief Wrapper for custom SQL string
+ */
+struct CustomSql
+{
+    explicit CustomSql(std::string content) : content_(std::move(content))
+    {
+    }
+
+    std::string content_;
+};
+
+/**
+ * @brief User-defined literal to convert a string to CustomSql
+ */
+inline CustomSql operator""_sql(const char *str, size_t)
+{
+    return CustomSql(str);
+}
+
 /**
  * @brief this class represents a comparison condition.
  */
@@ -68,6 +92,56 @@ class DROGON_EXPORT Criteria
     std::string criteriaString() const
     {
         return conditionString_;
+    }
+
+    /**
+     * @brief Construct a new custom Criteria object
+     *
+     * @param sql The SQL statement to be executed.
+     * @param args The parameters to be passed to the placeholders.
+     *
+     * @note
+     *
+     * Use $? as placeholders in the SQL statement.
+     *
+     * Be careful that the placeholders are not the same as the ones in
+     * functions such as drogon::orm::DbClient::execSqlAsync. Which means you
+     * couldn't use numeric placeholders such as $1, $2 to represent the order
+     * of the arguments.
+     *
+     * The arguments should be in the same order as the placeholders.
+     *
+     */
+    template <typename... Arguments>
+    explicit Criteria(const CustomSql &sql, Arguments &&...args)
+    {
+        conditionString_ = sql.content_;
+        outputArgumentsFunc_ =
+            [args = std::make_tuple(std::forward<Arguments>(args)...)](
+                internal::SqlBinder &binder) mutable {
+                return std::apply(
+                    [&binder](auto &&...args) {
+                        (void)std::initializer_list<int>{
+                            (binder << std::forward<Arguments>(args), 0)...};
+                    },
+                    std::move(args));
+            };
+    }
+
+    template <typename... Arguments>
+    explicit Criteria(CustomSql &&sql, Arguments &&...args)
+    {
+        conditionString_ = std::move(sql.content_);
+        outputArgumentsFunc_ =
+            [args = std::make_tuple(std::forward<Arguments>(args)...)](
+                internal::SqlBinder &binder) mutable {
+                return std::apply(
+                    [&binder](auto &&...args) {
+                        (void)std::initializer_list<int>{
+                            (binder << std::forward<Arguments>(args), 0)...};
+                    },
+                    std::move(args));
+            };
     }
 
     /**
@@ -107,8 +181,9 @@ class DROGON_EXPORT Criteria
             case CompareOperator::Like:
                 conditionString_ += " like $?";
                 break;
-            case CompareOperator::IsNull:
-            case CompareOperator::IsNotNull:
+            case CompareOperator::NotLike:
+                conditionString_ += " not like $?";
+                break;
             default:
                 break;
         }
@@ -123,11 +198,21 @@ class DROGON_EXPORT Criteria
              const CompareOperator &opera,
              const std::vector<T> &args)
     {
-        assert(opera == CompareOperator::In && args.size() > 0);
-        conditionString_ = colName + " in (";
-        for (size_t i = 0; i < args.size(); ++i)
+        const auto argsSize = args.size();
+        assert(((opera == CompareOperator::In) ||
+                (opera == CompareOperator::NotIn)) &&
+               (argsSize > 0));
+        if (opera == CompareOperator::In)
         {
-            if (i < args.size() - 1)
+            conditionString_ = colName + " in (";
+        }
+        else if (opera == CompareOperator::NotIn)
+        {
+            conditionString_ = colName + " not in (";
+        }
+        for (size_t i = 0; i < argsSize; ++i)
+        {
+            if (i < (argsSize - 1))
                 conditionString_.append("$?,");
             else
                 conditionString_.append("$?");
@@ -146,11 +231,21 @@ class DROGON_EXPORT Criteria
              const CompareOperator &opera,
              std::vector<T> &&args)
     {
-        assert(opera == CompareOperator::In && args.size() > 0);
-        conditionString_ = colName + " in (";
-        for (size_t i = 0; i < args.size(); ++i)
+        const auto argsSize = args.size();
+        assert(((opera == CompareOperator::In) ||
+                (opera == CompareOperator::NotIn)) &&
+               (argsSize > 0));
+        if (opera == CompareOperator::In)
         {
-            if (i < args.size() - 1)
+            conditionString_ = colName + " in (";
+        }
+        else if (opera == CompareOperator::NotIn)
+        {
+            conditionString_ = colName + " not in (";
+        }
+        for (size_t i = 0; i < argsSize; ++i)
+        {
+            if (i < (argsSize - 1))
                 conditionString_.append("$?,");
             else
                 conditionString_.append("$?");
@@ -182,7 +277,7 @@ class DROGON_EXPORT Criteria
      */
     template <typename T>
     Criteria(const std::string &colName, T &&arg)
-        : Criteria(colName, CompareOperator::EQ, arg)
+        : Criteria(colName, CompareOperator::EQ, std::forward<T>(arg))
     {
     }
 
@@ -214,10 +309,12 @@ class DROGON_EXPORT Criteria
                 break;
         }
     }
+
     Criteria(const std::string &colName, CompareOperator &opera)
         : Criteria(colName, (const CompareOperator &)opera)
     {
     }
+
     Criteria(const std::string &colName, CompareOperator &&opera)
         : Criteria(colName, (const CompareOperator &)opera)
     {
@@ -237,11 +334,8 @@ class DROGON_EXPORT Criteria
      * ["user_name","in",["Tom","Bob"]] means 'user_name in ('Tom', 'Bob')'
      * ["price","<",1000] means 'price < 1000'
      */
-    Criteria(const Json::Value &json) noexcept(false);
-
-    Criteria()
-    {
-    }
+    explicit Criteria(const Json::Value &json) noexcept(false);
+    Criteria() = default;
 
     /**
      * @brief Output arguments to the SQL binder object.

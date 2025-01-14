@@ -18,7 +18,7 @@
 #include <exception>
 #include <drogon/orm/DbTypes.h>
 #include <drogon/utils/Utilities.h>
-#include <drogon/utils/string_view.h>
+#include <string_view>
 #include <errmsg.h>
 #ifndef _WIN32
 #include <poll.h>
@@ -31,16 +31,18 @@
 
 using namespace drogon;
 using namespace drogon::orm;
+
 namespace drogon
 {
 namespace orm
 {
-Result makeResult(
-    const std::shared_ptr<MYSQL_RES> &r = std::shared_ptr<MYSQL_RES>(nullptr),
-    Result::SizeType affectedRows = 0,
-    unsigned long long insertId = 0)
+Result makeResult(std::shared_ptr<MYSQL_RES> &&r = nullptr,
+                  Result::SizeType affectedRows = 0,
+                  unsigned long long insertId = 0)
 {
-    return Result{std::make_shared<MysqlResultImpl>(r, affectedRows, insertId)};
+    return Result{std::make_shared<MysqlResultImpl>(std::move(r),
+                                                    affectedRows,
+                                                    insertId)};
 }
 
 }  // namespace orm
@@ -54,9 +56,13 @@ MysqlConnection::MysqlConnection(trantor::EventLoop *loop,
           delete p;
       }))
 {
+    static MysqlEnv env;
+    static thread_local MysqlThreadEnv threadEnv;
     mysql_init(mysqlPtr_.get());
     mysql_options(mysqlPtr_.get(), MYSQL_OPT_NONBLOCK, nullptr);
-
+#ifdef HAS_MYSQL_OPTIONSV
+    mysql_optionsv(mysqlPtr_.get(), MYSQL_OPT_RECONNECT, &reconnect_);
+#endif
     // Get the key and value
     auto connParams = parseConnString(connInfo);
     for (auto const &kv : connParams)
@@ -64,7 +70,10 @@ MysqlConnection::MysqlConnection(trantor::EventLoop *loop,
         auto key = kv.first;
         auto value = kv.second;
 
-        std::transform(key.begin(), key.end(), key.begin(), tolower);
+        std::transform(key.begin(),
+                       key.end(),
+                       key.begin(),
+                       [](unsigned char c) { return tolower(c); });
         // LOG_TRACE << key << "=" << value;
         if (key == "host")
         {
@@ -92,6 +101,10 @@ MysqlConnection::MysqlConnection(trantor::EventLoop *loop,
             characterSet_ = value;
         }
     }
+}
+
+void MysqlConnection::init()
+{
     loop_->queueInLoop([this]() {
         MYSQL *ret;
         status_ = ConnectStatus::Connecting;
@@ -111,10 +124,13 @@ MysqlConnection::MysqlConnection(trantor::EventLoop *loop,
         auto fd = mysql_get_socket(mysqlPtr_.get());
         if (fd < 0)
         {
-            LOG_FATAL << "Socket fd < 0, Usually this is because the number of "
-                         "files opened by the program exceeds the system "
-                         "limit. Please use the ulimit command to check.";
-            exit(1);
+            LOG_ERROR << "Connection with MySQL could not be established";
+            if (closeCallback_)
+            {
+                auto thisPtr = shared_from_this();
+                closeCallback_(thisPtr);
+            }
+            return;
         }
         channelPtr_ = std::make_unique<trantor::Channel>(loop_, fd);
         channelPtr_->setEventCallback([this]() { handleEvent(); });
@@ -159,6 +175,7 @@ void MysqlConnection::handleClosed()
     auto thisPtr = shared_from_this();
     closeCallback_(thisPtr);
 }
+
 void MysqlConnection::disconnect()
 {
     auto thisPtr = shared_from_this();
@@ -173,6 +190,7 @@ void MysqlConnection::disconnect()
     });
     f.get();
 }
+
 void MysqlConnection::handleTimeout()
 {
     int status = 0;
@@ -218,6 +236,7 @@ void MysqlConnection::handleTimeout()
     {
     }
 }
+
 void MysqlConnection::handleCmd(int status)
 {
     switch (execStatus_)
@@ -290,6 +309,7 @@ void MysqlConnection::handleCmd(int status)
             return;
     }
 }
+
 void MysqlConnection::handleEvent()
 {
     int status = 0;
@@ -342,6 +362,7 @@ void MysqlConnection::handleEvent()
         continueSetCharacterSet(status);
     }
 }
+
 void MysqlConnection::continueSetCharacterSet(int status)
 {
     int err;
@@ -365,6 +386,7 @@ void MysqlConnection::continueSetCharacterSet(int status)
     }
     setChannel();
 }
+
 void MysqlConnection::startSetCharacterSet()
 {
     int err;
@@ -394,8 +416,9 @@ void MysqlConnection::startSetCharacterSet()
     }
     setChannel();
 }
+
 void MysqlConnection::execSqlInLoop(
-    string_view &&sql,
+    std::string_view &&sql,
     size_t paraNum,
     std::vector<const char *> &&parameters,
     std::vector<int> &&length,
@@ -518,6 +541,7 @@ void MysqlConnection::outputError()
         handleClosed();
     }
 }
+
 void MysqlConnection::startQuery()
 {
     int err;
@@ -541,6 +565,7 @@ void MysqlConnection::startQuery()
         startStoreResult(true);
     }
 }
+
 void MysqlConnection::startStoreResult(bool queueInLoop)
 {
     MYSQL_RES *ret;
@@ -575,12 +600,13 @@ void MysqlConnection::startStoreResult(bool queueInLoop)
         }
     }
 }
+
 void MysqlConnection::getResult(MYSQL_RES *res)
 {
     auto resultPtr = std::shared_ptr<MYSQL_RES>(res, [](MYSQL_RES *r) {
         mysql_free_result(r);
     });
-    auto Result = makeResult(resultPtr,
+    auto Result = makeResult(std::move(resultPtr),
                              mysql_affected_rows(mysqlPtr_.get()),
                              mysql_insert_id(mysqlPtr_.get()));
     if (isWorking_)

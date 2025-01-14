@@ -16,7 +16,7 @@
 #include "DbConnection.h"
 #include "../../lib/src/TaskTimeoutFlag.h"
 #include <drogon/config.h>
-#include <drogon/utils/string_view.h>
+#include <string_view>
 #if USE_POSTGRESQL
 #include "postgresql_impl/PgConnection.h"
 #endif
@@ -48,9 +48,17 @@ using namespace drogon;
 using namespace drogon::orm;
 
 DbClientImpl::DbClientImpl(const std::string &connInfo,
-                           const size_t connNum,
+                           size_t connNum,
+#if LIBPQ_SUPPORTS_BATCH_MODE
+                           ClientType type,
+                           bool autoBatch)
+#else
                            ClientType type)
+#endif
     : numberOfConnections_(connNum),
+#if LIBPQ_SUPPORTS_BATCH_MODE
+      autoBatch_(autoBatch),
+#endif
       loops_(type == ClientType::Sqlite3
                  ? 1
                  : (connNum < std::thread::hardware_concurrency()
@@ -63,6 +71,7 @@ DbClientImpl::DbClientImpl(const std::string &connInfo,
     LOG_TRACE << "type=" << (int)type;
     assert(connNum > 0);
 }
+
 void DbClientImpl::init()
 {
     // LOG_DEBUG << loops_.getLoopNum();
@@ -72,10 +81,7 @@ void DbClientImpl::init()
         for (size_t i = 0; i < numberOfConnections_; ++i)
         {
             auto loop = loops_.getNextLoop();
-            loop->runInLoop([this, loop]() {
-                std::lock_guard<std::mutex> lock(connectionsMutex_);
-                connections_.insert(newConnection(loop));
-            });
+            loop->runInLoop([this, loop]() { newConnection(loop); });
         }
     }
     else if (type_ == ClientType::Sqlite3)
@@ -83,44 +89,33 @@ void DbClientImpl::init()
         sharedMutexPtr_ = std::make_shared<SharedMutex>();
         assert(sharedMutexPtr_);
 
-        std::lock_guard<std::mutex> lock(connectionsMutex_);
         for (size_t i = 0; i < numberOfConnections_; ++i)
         {
-            connections_.insert(newConnection(nullptr));
+            newConnection(nullptr);
         }
     }
 }
+
 DbClientImpl::~DbClientImpl() noexcept
 {
-    std::lock_guard<std::mutex> lock(connectionsMutex_);
-    for (auto const &conn : connections_)
+    closeAll();
+}
+
+void DbClientImpl::closeAll()
+{
+    decltype(connections_) connections;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        connections.swap(connections_);
+        readyConnections_.clear();
+        busyConnections_.clear();
+    }
+    for (auto const &conn : connections)
     {
         conn->disconnect();
     }
-    connections_.clear();
-    readyConnections_.clear();
-    busyConnections_.clear();
 }
 
-void DbClientImpl::execSql(
-    const DbConnectionPtr &conn,
-    string_view &&sql,
-    size_t paraNum,
-    std::vector<const char *> &&parameters,
-    std::vector<int> &&length,
-    std::vector<int> &&format,
-    ResultCallback &&rcb,
-    std::function<void(const std::exception_ptr &)> &&exceptCallback)
-{
-    assert(conn);
-    conn->execSql(std::move(sql),
-                  paraNum,
-                  std::move(parameters),
-                  std::move(length),
-                  std::move(format),
-                  std::move(rcb),
-                  std::move(exceptCallback));
-}
 void DbClientImpl::execSql(
     const char *sql,
     size_t sqlLength,
@@ -163,7 +158,7 @@ void DbClientImpl::execSql(
             {
                 // LOG_TRACE << "Push query to buffer";
                 std::shared_ptr<SqlCmd> cmd =
-                    std::make_shared<SqlCmd>(string_view{sql, sqlLength},
+                    std::make_shared<SqlCmd>(std::string_view{sql, sqlLength},
                                              paraNum,
                                              std::move(parameters),
                                              std::move(length),
@@ -183,14 +178,13 @@ void DbClientImpl::execSql(
     }
     if (conn)
     {
-        execSql(conn,
-                string_view{sql, sqlLength},
-                paraNum,
-                std::move(parameters),
-                std::move(length),
-                std::move(format),
-                std::move(rcb),
-                std::move(exceptCallback));
+        conn->execSql({sql, sqlLength},
+                      paraNum,
+                      std::move(parameters),
+                      std::move(length),
+                      std::move(format),
+                      std::move(rcb),
+                      std::move(exceptCallback));
         return;
     }
     if (busy)
@@ -201,6 +195,7 @@ void DbClientImpl::execSql(
         return;
     }
 }
+
 void DbClientImpl::newTransactionAsync(
     const std::function<void(const std::shared_ptr<Transaction> &)> &callback)
 {
@@ -266,12 +261,13 @@ void DbClientImpl::newTransactionAsync(
                       callback));
     }
 }
+
 void DbClientImpl::makeTrans(
     const DbConnectionPtr &conn,
     std::function<void(const std::shared_ptr<Transaction> &)> &&callback)
 {
     std::weak_ptr<DbClientImpl> weakThis = shared_from_this();
-    auto trans = std::shared_ptr<TransactionImpl>(new TransactionImpl(
+    auto trans = std::make_shared<TransactionImpl>(
         type_, conn, std::function<void(bool)>(), [weakThis, conn]() {
             auto thisPtr = weakThis.lock();
             if (!thisPtr)
@@ -310,7 +306,7 @@ void DbClientImpl::makeTrans(
                 });
                 thisPtr->handleNewTask(conn);
             });
-        }));
+        });
     trans->doBegin();
     if (timeout_ > 0.0)
     {
@@ -319,6 +315,7 @@ void DbClientImpl::makeTrans(
     conn->loop()->queueInLoop(
         [callback = std::move(callback), trans]() { callback(trans); });
 }
+
 std::shared_ptr<Transaction> DbClientImpl::newTransaction(
     const std::function<void(bool)> &commitCallback) noexcept(false)
 {
@@ -366,14 +363,13 @@ void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
     }
     if (cmd)
     {
-        execSql(connPtr,
-                std::move(cmd->sql_),
-                cmd->parametersNumber_,
-                std::move(cmd->parameters_),
-                std::move(cmd->lengths_),
-                std::move(cmd->formats_),
-                std::move(cmd->callback_),
-                std::move(cmd->exceptionCallback_));
+        connPtr->execSql(std::move(cmd->sql_),
+                         cmd->parametersNumber_,
+                         std::move(cmd->parameters_),
+                         std::move(cmd->lengths_),
+                         std::move(cmd->formats_),
+                         std::move(cmd->callback_),
+                         std::move(cmd->exceptionCallback_));
         return;
     }
 }
@@ -384,7 +380,12 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
     if (type_ == ClientType::PostgreSQL)
     {
 #if USE_POSTGRESQL
-        connPtr = std::make_shared<PgConnection>(loop, connectionInfo_);
+#if LIBPQ_SUPPORTS_BATCH_MODE
+        connPtr =
+            std::make_shared<PgConnection>(loop, connectionInfo_, autoBatch_);
+#else
+        connPtr = std::make_shared<PgConnection>(loop, connectionInfo_, false);
+#endif
 #else
         return nullptr;
 #endif
@@ -400,12 +401,9 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
     else if (type_ == ClientType::Sqlite3)
     {
 #if USE_SQLITE3
-        auto sqlite3ConnPtr =
-            std::make_shared<Sqlite3Connection>(loop,
-                                                connectionInfo_,
-                                                sharedMutexPtr_);
-        sqlite3ConnPtr->init();
-        connPtr = sqlite3ConnPtr;
+        connPtr = std::make_shared<Sqlite3Connection>(loop,
+                                                      connectionInfo_,
+                                                      sharedMutexPtr_);
 #else
         return nullptr;
 #endif
@@ -435,8 +433,8 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
             auto thisPtr = weakPtr.lock();
             if (!thisPtr)
                 return;
-            std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
-            thisPtr->connections_.insert(thisPtr->newConnection(loop));
+
+            thisPtr->newConnection(loop);
         });
     });
     connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {
@@ -462,6 +460,16 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
             return;
         thisPtr->handleNewTask(connPtr);
     });
+
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex_);
+        connections_.insert(connPtr);
+    }
+
+    // Init database connection only after all callbacks are set and connPtr
+    // is added to connections_.
+    connPtr->init();
+
     // std::cout<<"newConn end"<<connPtr<<std::endl;
     return connPtr;
 }
@@ -539,7 +547,7 @@ void DbClientImpl::execSqlWithTimeout(
             {
                 // LOG_TRACE << "Push query to buffer";
                 auto command =
-                    std::make_shared<SqlCmd>(string_view{sql, sqlLength},
+                    std::make_shared<SqlCmd>(std::string_view{sql, sqlLength},
                                              paraNum,
                                              std::move(parameters),
                                              std::move(length),
@@ -560,14 +568,13 @@ void DbClientImpl::execSqlWithTimeout(
     }
     if (conn)
     {
-        execSql(conn,
-                string_view{sql, sqlLength},
-                paraNum,
-                std::move(parameters),
-                std::move(length),
-                std::move(format),
-                std::move(resultCallback),
-                std::move(exceptionCallback));
+        conn->execSql(std::string_view{sql, sqlLength},
+                      paraNum,
+                      std::move(parameters),
+                      std::move(length),
+                      std::move(format),
+                      std::move(resultCallback),
+                      std::move(exceptionCallback));
         timeoutFlagPtr->runTimer();
         return;
     }

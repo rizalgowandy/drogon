@@ -24,6 +24,7 @@
 #include <mutex>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -48,26 +49,41 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
         req->setMethod(drogon::Get);
         req->setPath("/");
         std::promise<int> waitCookie;
+        bool haveCert = false;
         auto f = waitCookie.get_future();
         client->sendRequest(req,
-                            [client, &waitCookie, TEST_CTX](
+                            [client, &waitCookie, &haveCert, TEST_CTX](
                                 ReqResult result, const HttpResponsePtr &resp) {
                                 REQUIRE(result == ReqResult::Ok);
 
                                 auto &id = resp->getCookie("JSESSIONID");
                                 REQUIRE(id);
 
+                                haveCert = resp->peerCertificate() != nullptr;
+
                                 sessionID = id;
                                 client->addCookie(id);
                                 waitCookie.set_value(1);
                             });
         f.get();
+        CHECK(haveCert == client->secure());
     }
     else
         client->addCookie(sessionID);
 
-    /// Test session
+    /// Test begin advice
     auto req = HttpRequest::newHttpRequest();
+    req->setMethod(drogon::Get);
+    req->setPath("/test_begin_advice");
+    client->sendRequest(req,
+                        [req, client, TEST_CTX](ReqResult result,
+                                                const HttpResponsePtr &resp) {
+                            REQUIRE(result == ReqResult::Ok);
+                            CHECK(resp->getBody() == "DrogonReady");
+                        });
+
+    /// Test session
+    req = HttpRequest::newHttpRequest();
     req->setMethod(drogon::Get);
     req->setPath("/slow");
     client->sendRequest(
@@ -517,7 +533,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
                                         const HttpResponsePtr &resp) {
                             REQUIRE(result == ReqResult::Ok);
                             // Only tests for serving a file, not the content
-                            // since no good way to read it on Windows witout
+                            // since no good way to read it on Windows without
                             // using the wild-char API
                         });
     /// Test custom content types
@@ -530,7 +546,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
                             CHECK(resp->contentType() == CT_CUSTOM);
                             CHECK(resp->contentTypeString() == "text/markdown");
                         });
-    /// Unknown files shoul be application/octet-stream
+    /// Unknown files should be application/octet-stream
     req = HttpRequest::newHttpRequest();
     req->setPath("/main.cc");
     client->sendRequest(
@@ -678,7 +694,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
                                              resp->getBody().begin()));
                         });
     // Test file upload
-    UploadFile file1("./drogon.jpg");
+    UploadFile file1("./中文.txt");
     UploadFile file2("./drogon.jpg", "drogon1.jpg");
     UploadFile file3("./config.example.json", "config.json", "file3");
     req = HttpRequest::newFileUploadRequest({file1, file2, file3});
@@ -926,7 +942,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
                         });
 
     // Same as cacheTest2. But the server has to handle this API through regex.
-    // it is intentionally made that the final part of the path can't conatin
+    // it is intentionally made that the final part of the path can't contain
     // a "z" character
     req = HttpRequest::newHttpRequest();
     req->setMethod(drogon::Get);
@@ -972,8 +988,85 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
                             CHECK(resp->getStatusCode() == k404NotFound);
                         });
 
+    // Post compressed data
+    req = HttpRequest::newHttpRequest();
+    std::string deadbeef = "deadbeef";
+    req->setPath("/api/v1/ApiTest/echoBody");
+    req->addHeader("Content-Encoding", "gzip");
+    req->setMethod(drogon::Post);
+    req->setBody(utils::gzipCompress(deadbeef.c_str(), deadbeef.size()));
+    client->sendRequest(req,
+                        [deadbeef, TEST_CTX](ReqResult result,
+                                             const HttpResponsePtr &resp) {
+                            REQUIRE(result == ReqResult::Ok);
+                            CHECK(resp->getStatusCode() == k200OK);
+                            CHECK(resp->body() == deadbeef);
+                        });
+
+    std::string largeString(128 * 1024, 'a');  // 128KB of 'a'
+    req = HttpRequest::newHttpRequest();
+    req->setPath("/api/v1/ApiTest/echoBody");
+    req->addHeader("Content-Encoding", "gzip");
+    req->setMethod(drogon::Post);
+    req->setBody(utils::gzipCompress(largeString.c_str(), largeString.size()));
+    client->sendRequest(req,
+                        [largeString, TEST_CTX](ReqResult result,
+                                                const HttpResponsePtr &resp) {
+                            REQUIRE(result == ReqResult::Ok);
+                            CHECK(resp->getStatusCode() == k200OK);
+                            CHECK(resp->body() == largeString);
+                        });
+
+#ifdef USE_BROTLI
+    // Post compressed data
+    req = HttpRequest::newHttpRequest();
+    req->setPath("/api/v1/ApiTest/echoBody");
+    req->addHeader("Content-Encoding", "br");
+    req->setMethod(drogon::Post);
+    req->setBody(utils::brotliCompress(deadbeef.c_str(), deadbeef.size()));
+    client->sendRequest(req,
+                        [deadbeef, TEST_CTX](ReqResult result,
+                                             const HttpResponsePtr &resp) {
+                            REQUIRE(result == ReqResult::Ok);
+                            CHECK(resp->getStatusCode() == k200OK);
+                            CHECK(resp->body() == deadbeef);
+                        });
+    req = HttpRequest::newHttpRequest();
+    req->setPath("/api/v1/ApiTest/echoBody");
+    req->addHeader("Content-Encoding", "br");
+    req->setMethod(drogon::Post);
+    req->setBody(
+        utils::brotliCompress(largeString.c_str(), largeString.size()));
+    client->sendRequest(req,
+                        [largeString, TEST_CTX](ReqResult result,
+                                                const HttpResponsePtr &resp) {
+                            REQUIRE(result == ReqResult::Ok);
+                            CHECK(resp->getStatusCode() == k200OK);
+                            CHECK(resp->body() == largeString);
+                        });
+#endif
+
+    // Test middleware
+    req = HttpRequest::newHttpRequest();
+    req->setPath("/test-middleware");
+    client->sendRequest(req,
+                        [TEST_CTX, req](ReqResult r,
+                                        const HttpResponsePtr &resp) {
+                            REQUIRE(r == ReqResult::Ok);
+                            CHECK(resp->body() == "1234test4321");
+                        });
+
+    req = HttpRequest::newHttpRequest();
+    req->setPath("/test-middleware-block");
+    client->sendRequest(req,
+                        [TEST_CTX, req](ReqResult r,
+                                        const HttpResponsePtr &resp) {
+                            REQUIRE(r == ReqResult::Ok);
+                            CHECK(resp->body() == "12block21");
+                        });
+
 #if defined(__cpp_impl_coroutine)
-    sync_wait([client, TEST_CTX]() -> Task<> {
+    async_run([client, TEST_CTX]() -> Task<> {
         // Test coroutine requests
         try
         {
@@ -997,7 +1090,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
         }
         catch (const std::exception &e)
         {
-            FAIL("Unexpected exception, what()" + std::string(e.what()));
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
         }
 
         // Test Coroutine exception
@@ -1010,7 +1103,7 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
         }
         catch (const std::exception &e)
         {
-            FAIL("Unexpected exception, what()" + std::string(e.what()));
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
         }
 
         // Test Coroutine exception with co_return
@@ -1023,9 +1116,65 @@ void doTest(const HttpClientPtr &client, std::shared_ptr<test::Case> TEST_CTX)
         }
         catch (const std::exception &e)
         {
-            FAIL("Unexpected exception, what()" + std::string(e.what()));
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
         }
-    }());
+
+        // Test coroutine filter
+        try
+        {
+            auto req = HttpRequest::newHttpRequest();
+            auto start = std::chrono::system_clock::now();
+            req->setPath("/api/v1/corotest/delay?secs=2");
+            auto resp = co_await client->sendRequestCoro(req);
+            CHECK(resp->getStatusCode() == k200OK);
+            auto end = std::chrono::system_clock::now();
+            std::chrono::duration<double, std::milli> duration = end - start;
+            CHECK(duration.count() >= 2000);
+        }
+        catch (const std::exception &e)
+        {
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
+        }
+
+        // Test coroutine handler with parameters
+        try
+        {
+            auto req = HttpRequest::newHttpRequest();
+            req->setPath("/api/v1/corotest/get_with_param/some_data");
+            auto resp = co_await client->sendRequestCoro(req);
+            CHECK(resp->getStatusCode() == k200OK);
+            CHECK(resp->getBody() == "some_data");
+        }
+        catch (const std::exception &e)
+        {
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
+        }
+        try
+        {
+            auto req = HttpRequest::newHttpRequest();
+            req->setPath("/api/v1/corotest/get_with_param2/some_data");
+            auto resp = co_await client->sendRequestCoro(req);
+            CHECK(resp->getStatusCode() == k200OK);
+            CHECK(resp->getBody() == "some_data");
+        }
+        catch (const std::exception &e)
+        {
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
+        }
+
+        // Test coroutine middleware
+        try
+        {
+            auto req = HttpRequest::newHttpRequest();
+            req->setPath("/test-middleware-coro");
+            auto resp = co_await client->sendRequestCoro(req);
+            CHECK(resp->body() == "12corotestcoro21");
+        }
+        catch (const std::exception &e)
+        {
+            FAIL("Unexpected exception, what(): " + std::string(e.what()));
+        }
+    });
 #endif
 }
 
@@ -1076,9 +1225,38 @@ DROGON_TEST(HttpsTest)
     doTest(client, TEST_CTX);
 }
 
+DROGON_TEST(HttpsTimeoutTest)
+{
+    if (!app().supportSSL())
+        return;
+
+    auto client = HttpClient::newHttpClient("https://127.0.0.1:8849",
+                                            app().getLoop(),
+                                            false,
+                                            false);
+    auto req = HttpRequest::newHttpRequest();
+    req->setPath("/api/v1/apitest/static");
+    req->setMethod(drogon::Get);
+    auto weakClient = std::weak_ptr<HttpClient>(client);
+    auto weakReq = std::weak_ptr<HttpRequest>(req);
+    client->sendRequest(
+        req,
+        [weakClient, weakReq, TEST_CTX](ReqResult result,
+                                        const HttpResponsePtr &resp) {
+            REQUIRE(result == ReqResult::Ok);
+            CHECK(resp->getStatusCode() == k200OK);
+
+            app().getLoop()->queueInLoop([weakClient, weakReq, TEST_CTX]() {
+                CHECK(weakReq.expired());
+                CHECK(weakClient.expired());
+            });
+        },
+        60);
+}
+
 int main(int argc, char **argv)
 {
-    trantor::Logger::setLogLevel(trantor::Logger::LogLevel::kTrace);
+    trantor::Logger::setLogLevel(trantor::Logger::LogLevel::kDebug);
     loadFileLengths();
 
     std::promise<void> p1;

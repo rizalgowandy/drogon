@@ -20,18 +20,26 @@
 #include <sstream>
 #include <thread>
 #include <trantor/utils/Logger.h>
-#if !defined(_WIN32) || defined(__MINGW32__)
+#if !defined(_WIN32)
 #include <unistd.h>
 #define os_access access
 #else
 #include <io.h>
+#ifndef __MINGW32__
 #define os_access _waccess
 #define R_OK 04
 #define W_OK 02
+#else
+#define os_access access
 #endif
+#endif
+
 #include <drogon/utils/Utilities.h>
+#include "ConfigAdapterManager.h"
+#include <filesystem>
 
 using namespace drogon;
+
 static bool bytesSize(std::string &sizeStr, size_t &size)
 {
     if (sizeStr.empty())
@@ -97,58 +105,66 @@ static bool bytesSize(std::string &sizeStr, size_t &size)
         return true;
     }
 }
+
 ConfigLoader::ConfigLoader(const std::string &configFile)
 {
     if (os_access(drogon::utils::toNativePath(configFile).c_str(), 0) != 0)
     {
-        std::cerr << "Config file " << configFile << " not found!" << std::endl;
-        exit(1);
+        throw std::runtime_error("Config file " + configFile + " not found!");
     }
     if (os_access(drogon::utils::toNativePath(configFile).c_str(), R_OK) != 0)
     {
-        std::cerr << "No permission to read config file " << configFile
-                  << std::endl;
-        exit(1);
+        throw std::runtime_error("No permission to read config file " +
+                                 configFile);
     }
     configFile_ = configFile;
+    auto pos = configFile.find_last_of('.');
+    if (pos == std::string::npos)
+    {
+        throw std::runtime_error("Invalid config file name!");
+    }
+    auto ext = configFile.substr(pos + 1);
     std::ifstream infile(drogon::utils::toNativePath(configFile).c_str(),
                          std::ifstream::in);
-    if (infile)
+    // get the content of the infile
+    std::string content((std::istreambuf_iterator<char>(infile)),
+                        std::istreambuf_iterator<char>());
+    try
     {
-        try
-        {
-            infile >> configJsonRoot_;
-        }
-        catch (const std::exception &exception)
-        {
-            std::cerr << "Configuration file format error! in " << configFile
-                      << ":" << std::endl;
-            std::cerr << exception.what() << std::endl;
-            exit(1);
-        }
+        configJsonRoot_ =
+            ConfigAdapterManager::instance().getJson(content, std::move(ext));
+    }
+    catch (std::exception &e)
+    {
+        throw std::runtime_error("Error reading config file " + configFile +
+                                 ": " + e.what());
     }
 }
+
 ConfigLoader::ConfigLoader(const Json::Value &data) : configJsonRoot_(data)
 {
 }
+
 ConfigLoader::ConfigLoader(Json::Value &&data)
     : configJsonRoot_(std::move(data))
 {
 }
+
 ConfigLoader::~ConfigLoader()
 {
 }
+
 static void loadLogSetting(const Json::Value &log)
 {
     if (!log)
         return;
+    auto useSpdlog = log.get("use_spdlog", false).asBool();
     auto logPath = log.get("log_path", "").asString();
-    if (logPath != "")
-    {
-        auto baseName = log.get("logfile_base_name", "").asString();
-        auto logSize = log.get("log_size_limit", 100000000).asUInt64();
-        HttpAppFrameworkImpl::instance().setLogPath(logPath, baseName, logSize);
-    }
+    auto baseName = log.get("logfile_base_name", "").asString();
+    auto logSize = log.get("log_size_limit", 100000000).asUInt64();
+    auto maxFiles = log.get("max_files", 0).asUInt();
+    HttpAppFrameworkImpl::instance().setLogPath(
+        logPath, baseName, logSize, maxFiles, useSpdlog);
     auto logLevel = log.get("log_level", "DEBUG").asString();
     if (logLevel == "TRACE")
     {
@@ -166,7 +182,10 @@ static void loadLogSetting(const Json::Value &log)
     {
         trantor::Logger::setLogLevel(trantor::Logger::kWarn);
     }
+    auto localTime = log.get("display_local_time", false).asBool();
+    trantor::Logger::setDisplayLocalTime(localTime);
 }
+
 static void loadControllers(const Json::Value &controllers)
 {
     if (!controllers)
@@ -186,7 +205,7 @@ static void loadControllers(const Json::Value &controllers)
                 std::transform(strMethod.begin(),
                                strMethod.end(),
                                strMethod.begin(),
-                               tolower);
+                               [](unsigned char c) { return tolower(c); });
                 if (strMethod == "get")
                 {
                     constraints.push_back(Get);
@@ -195,7 +214,7 @@ static void loadControllers(const Json::Value &controllers)
                 {
                     constraints.push_back(Post);
                 }
-                else if (strMethod == "head")  // The branch nerver work
+                else if (strMethod == "head")  // The branch never work
                 {
                     constraints.push_back(Head);
                 }
@@ -223,6 +242,7 @@ static void loadControllers(const Json::Value &controllers)
         drogon::app().registerHttpSimpleController(path, ctrlName, constraints);
     }
 }
+
 static void loadApp(const Json::Value &app)
 {
     if (!app)
@@ -244,9 +264,17 @@ static void loadApp(const Json::Value &app)
     drogon::app().setThreadNum(threadsNum);
     // session
     auto enableSession = app.get("enable_session", false).asBool();
-    auto timeout = app.get("session_timeout", 0).asUInt64();
     if (enableSession)
-        drogon::app().enableSession(timeout);
+    {
+        auto timeout = app.get("session_timeout", 0).asUInt64();
+        auto sameSite = app.get("session_same_site", "Null").asString();
+        auto cookieKey = app.get("session_cookie_key", "JSESSIONID").asString();
+        auto maxAge = app.get("session_max_age", -1).asInt();
+        drogon::app().enableSession(timeout,
+                                    Cookie::convertString2SameSite(sameSite),
+                                    cookieKey,
+                                    maxAge);
+    }
     else
         drogon::app().disableSession();
     // document root
@@ -262,15 +290,16 @@ static void loadApp(const Json::Value &app)
             std::vector<std::pair<std::string, std::string>> headers;
             for (auto &header : app["static_file_headers"])
             {
-                headers.emplace_back(std::make_pair<std::string, std::string>(
-                    header["name"].asString(), header["value"].asString()));
+                headers.emplace_back(
+                    std::make_pair(header["name"].asString(),
+                                   header["value"].asString()));
             }
             drogon::app().setStaticFileHeaders(headers);
         }
         else
         {
-            std::cerr << "The static_file_headers option must be an array\n";
-            exit(1);
+            throw std::runtime_error(
+                "The static_file_headers option must be an array");
         }
     }
     // upload path
@@ -294,8 +323,7 @@ static void loadApp(const Json::Value &app)
         auto &locations = app["locations"];
         if (!locations.isArray())
         {
-            std::cerr << "The locations option must be an array\n";
-            exit(1);
+            throw std::runtime_error("The locations option must be an array");
         }
         for (auto &location : locations)
         {
@@ -328,9 +356,8 @@ static void loadApp(const Json::Value &app)
                 }
                 else
                 {
-                    std::cerr << "the filters of location '" << uri
-                              << "' should be an array" << std::endl;
-                    exit(1);
+                    throw std::runtime_error("the filters of location '" + uri +
+                                             "' should be an array");
                 }
             }
             else
@@ -376,6 +403,8 @@ static void loadApp(const Json::Value &app)
         }
     }
 #endif
+    auto stackLimit = app.get("json_parser_stack_limit", 1000).asUInt64();
+    drogon::app().setJsonParserStackLimit(stackLimit);
     auto unicodeEscaping =
         app.get("enable_unicode_escaping_in_json", true).asBool();
     drogon::app().setUnicodeEscapingInJson(unicodeEscaping);
@@ -385,7 +414,8 @@ static void loadApp(const Json::Value &app)
         auto precisionLength = precision.get("precision", 0).asUInt64();
         auto precisionType =
             precision.get("precision_type", "significant").asString();
-        drogon::app().setFloatPrecisionInJson(precisionLength, precisionType);
+        drogon::app().setFloatPrecisionInJson((unsigned int)precisionLength,
+                                              precisionType);
     }
     // log
     loadLogSetting(app["log"]);
@@ -442,8 +472,7 @@ static void loadApp(const Json::Value &app)
     }
     else
     {
-        std::cerr << "Error format of client_max_body_size" << std::endl;
-        exit(1);
+        throw std::runtime_error("Error format of client_max_body_size");
     }
     auto maxMemoryBodySize =
         app.get("client_max_memory_body_size", "64K").asString();
@@ -453,8 +482,7 @@ static void loadApp(const Json::Value &app)
     }
     else
     {
-        std::cerr << "Error format of client_max_memory_body_size" << std::endl;
-        exit(1);
+        throw std::runtime_error("Error format of client_max_memory_body_size");
     }
     auto maxWsMsgSize =
         app.get("client_max_websocket_message_size", "128K").asString();
@@ -464,9 +492,8 @@ static void loadApp(const Json::Value &app)
     }
     else
     {
-        std::cerr << "Error format of client_max_websocket_message_size"
-                  << std::endl;
-        exit(1);
+        throw std::runtime_error(
+            "Error format of client_max_websocket_message_size");
     }
     drogon::app().enableReusePort(app.get("reuse_port", false).asBool());
     drogon::app().setHomePage(app.get("home_page", "index.html").asString());
@@ -494,7 +521,14 @@ static void loadApp(const Json::Value &app)
                 drogon::app().registerCustomExtensionMime(extension, mime);
         }
     }
+    bool enableCompressedRequests =
+        app.get("enabled_compressed_request", false).asBool();
+    drogon::app().enableCompressedRequest(enableCompressedRequests);
+
+    drogon::app().enableRequestStream(
+        app.get("enable_request_stream", false).asBool());
 }
+
 static void loadDbClients(const Json::Value &dbClients)
 {
     if (!dbClients)
@@ -502,15 +536,17 @@ static void loadDbClients(const Json::Value &dbClients)
     for (auto const &client : dbClients)
     {
         auto type = client.get("rdbms", "postgresql").asString();
-        std::transform(type.begin(), type.end(), type.begin(), ::tolower);
+        std::transform(type.begin(),
+                       type.end(),
+                       type.begin(),
+                       [](unsigned char c) { return tolower(c); });
         auto host = client.get("host", "127.0.0.1").asString();
-        auto port = client.get("port", 5432).asUInt();
+        unsigned short port = client.get("port", 5432).asUInt();
         auto dbname = client.get("dbname", "").asString();
-        if (dbname == "" && type != "sqlite3")
+        if (dbname.empty() && type != "sqlite3")
         {
-            std::cerr << "Please configure dbname in the configuration file"
-                      << std::endl;
-            exit(1);
+            throw std::runtime_error(
+                "Please configure dbname in the configuration file");
         }
         auto user = client.get("user", "postgres").asString();
         auto password = client.get("passwd", "").asString();
@@ -531,19 +567,33 @@ static void loadDbClients(const Json::Value &dbClients)
         {
             characterSet = client.get("client_encoding", "").asString();
         }
+        auto connectOptions = client.get("connect_options", Json::Value());
         auto timeout = client.get("timeout", -1.0).asDouble();
-        drogon::app().createDbClient(type,
-                                     host,
-                                     (unsigned short)port,
-                                     dbname,
-                                     user,
-                                     password,
-                                     connNum,
-                                     filename,
-                                     name,
-                                     isFast,
-                                     characterSet,
-                                     timeout);
+        auto autoBatch = client.get("auto_batch", false).asBool();
+
+        std::unordered_map<std::string, std::string> options;
+        if (connectOptions.isObject() && !connectOptions.empty())
+        {
+            for (const auto &key : connectOptions.getMemberNames())
+            {
+                options[key] = connectOptions[key].asString();
+            }
+        }
+
+        HttpAppFrameworkImpl::instance().addDbClient(type,
+                                                     host,
+                                                     port,
+                                                     dbname,
+                                                     user,
+                                                     password,
+                                                     connNum,
+                                                     filename,
+                                                     name,
+                                                     isFast,
+                                                     characterSet,
+                                                     timeout,
+                                                     autoBatch,
+                                                     std::move(options));
     }
 }
 
@@ -553,8 +603,15 @@ static void loadRedisClients(const Json::Value &redisClients)
         return;
     for (auto const &client : redisClients)
     {
+        std::promise<std::string> promise;
+        auto future = promise.get_future();
         auto host = client.get("host", "127.0.0.1").asString();
+        trantor::Resolver::newResolver()->resolve(
+            host, [&promise](const trantor::InetAddress &address) {
+                promise.set_value(address.toIp());
+            });
         auto port = client.get("port", 6379).asUInt();
+        auto username = client.get("username", "").asString();
         auto password = client.get("passwd", "").asString();
         if (password.empty())
         {
@@ -569,8 +626,16 @@ static void loadRedisClients(const Json::Value &redisClients)
         auto isFast = client.get("is_fast", false).asBool();
         auto timeout = client.get("timeout", -1.0).asDouble();
         auto db = client.get("db", 0).asUInt();
-        drogon::app().createRedisClient(
-            host, port, name, password, connNum, isFast, timeout, db);
+        auto hostIp = future.get();
+        drogon::app().createRedisClient(hostIp,
+                                        port,
+                                        name,
+                                        password,
+                                        connNum,
+                                        isFast,
+                                        timeout,
+                                        db,
+                                        username);
     }
 }
 
@@ -607,6 +672,7 @@ static void loadListeners(const Json::Value &listeners)
             addr, port, useSSL, cert, key, useOldTLS, sslConfCmds);
     }
 }
+
 static void loadSSL(const Json::Value &sslConf)
 {
     if (!sslConf)
@@ -631,6 +697,7 @@ static void loadSSL(const Json::Value &sslConf)
     }
     drogon::app().setSSLConfigCommands(sslConfCmds);
 }
+
 void ConfigLoader::load()
 {
     // std::cout<<configJsonRoot_<<std::endl;

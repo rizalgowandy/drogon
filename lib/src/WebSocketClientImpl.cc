@@ -22,11 +22,7 @@
 #include <drogon/utils/Utilities.h>
 #include <drogon/config.h>
 #include <trantor/net/InetAddress.h>
-#ifdef OpenSSL_FOUND
-#include <openssl/sha.h>
-#else
-#include "ssl_funcs/Sha1.h"
-#endif
+#include <trantor/utils/Utilities.h>
 
 using namespace drogon;
 using namespace trantor;
@@ -34,10 +30,12 @@ using namespace trantor;
 WebSocketClientImpl::~WebSocketClientImpl()
 {
 }
+
 WebSocketConnectionPtr WebSocketClientImpl::getConnection()
 {
     return websockConnPtr_;
 }
+
 void WebSocketClientImpl::stop()
 {
     stop_ = true;
@@ -48,6 +46,7 @@ void WebSocketClientImpl::stop()
     }
     tcpClientPtr_.reset();
 }
+
 void WebSocketClientImpl::createTcpClient()
 {
     LOG_TRACE << "New TcpClient," << serverAddr_.toIpPort();
@@ -55,7 +54,14 @@ void WebSocketClientImpl::createTcpClient()
         std::make_shared<trantor::TcpClient>(loop_, serverAddr_, "httpClient");
     if (useSSL_)
     {
-        tcpClientPtr_->enableSSL(useOldTLS_, validateCert_, domain_);
+        auto policy = trantor::TLSPolicy::defaultClientPolicy();
+        policy->setUseOldTLS(useOldTLS_)
+            .setValidate(validateCert_)
+            .setHostname(domain_)
+            .setConfCmds(sslConfCmds_)
+            .setCertPath(clientCertPath_)
+            .setKeyPath(clientKeyPath_);
+        tcpClientPtr_->enableSSL(std::move(policy));
     }
     auto thisPtr = shared_from_this();
     std::weak_ptr<WebSocketClientImpl> weakPtr = thisPtr;
@@ -110,6 +116,7 @@ void WebSocketClientImpl::createTcpClient()
         });
     tcpClientPtr_->connect();
 }
+
 void WebSocketClientImpl::connectToServerInLoop()
 {
     loop_->assertInLoopThread();
@@ -130,11 +137,11 @@ void WebSocketClientImpl::connectToServerInLoop()
 
     auto wsKey = wsKey_;
     wsKey.append("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    unsigned char accKey[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char *>(wsKey.c_str()),
-         wsKey.length(),
-         accKey);
-    wsAccept_ = utils::base64Encode(accKey, SHA_DIGEST_LENGTH);
+    unsigned char accKey[20];
+    static_assert(sizeof(accKey) == sizeof(trantor::utils::Hash160));
+    auto sha1 = trantor::utils::sha1(wsKey);
+    memcpy(accKey, &sha1, sizeof(sha1));
+    wsAccept_ = utils::base64Encode(accKey, 20);
 
     upgradeRequest_->addHeader("Sec-WebSocket-Key", wsKey_);
     // upgradeRequest_->addHeader("Sec-WebSocket-Version","13");
@@ -208,8 +215,10 @@ void WebSocketClientImpl::onRecvWsMessage(
     const trantor::TcpConnectionPtr &connPtr,
     trantor::MsgBuffer *msgBuffer)
 {
-    assert(websockConnPtr_);
-    websockConnPtr_->onNewMessage(connPtr, msgBuffer);
+    if (websockConnPtr_)
+    {
+        websockConnPtr_->onNewMessage(connPtr, msgBuffer);
+    }
 }
 
 void WebSocketClientImpl::onRecvMessage(
@@ -328,7 +337,7 @@ WebSocketClientImpl::WebSocketClientImpl(trantor::EventLoop *loop,
     std::transform(lowerHost.begin(),
                    lowerHost.end(),
                    lowerHost.begin(),
-                   tolower);
+                   [](unsigned char c) { return tolower(c); });
     if (lowerHost.find("wss://") != std::string::npos)
     {
         useSSL_ = true;
@@ -443,6 +452,22 @@ void WebSocketClientImpl::connectToServer(
             thisPtr->requestCallback_ = callback;
             thisPtr->connectToServerInLoop();
         });
+    }
+}
+
+void WebSocketClientImpl::setCertPath(const std::string &cert,
+                                      const std::string &key)
+{
+    clientCertPath_ = cert;
+    clientKeyPath_ = key;
+}
+
+void WebSocketClientImpl::addSSLConfigs(
+    const std::vector<std::pair<std::string, std::string>> &sslConfCmds)
+{
+    for (const auto &cmd : sslConfCmds)
+    {
+        sslConfCmds_.push_back(cmd);
     }
 }
 

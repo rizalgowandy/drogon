@@ -13,7 +13,7 @@
  */
 #pragma once
 
-#include <drogon/utils/optional.h>
+#include <trantor/utils/NonCopyable.h>
 #include <trantor/net/EventLoop.h>
 #include <trantor/utils/Logger.h>
 #include <algorithm>
@@ -24,8 +24,8 @@
 #include <exception>
 #include <future>
 #include <mutex>
-#include <list>
 #include <type_traits>
+#include <optional>
 
 namespace drogon
 {
@@ -83,20 +83,73 @@ struct is_awaitable<
 template <typename T>
 constexpr bool is_awaitable_v = is_awaitable<T>::value;
 
+/**
+ * @struct final_awaiter
+ * @brief An awaiter for `Task::promise_type::final_suspend()`. Transfer
+ * execution back to the coroutine who is co_awaiting this Task.
+ */
 struct final_awaiter
 {
     bool await_ready() noexcept
     {
         return false;
     }
+
     template <typename T>
     auto await_suspend(std::coroutine_handle<T> handle) noexcept
     {
         return handle.promise().continuation_;
     }
+
     void await_resume() noexcept
     {
     }
+};
+
+/**
+ * @struct task_awaiter
+ * @brief Convert Task to an awaiter when it is co_awaited.
+ * Following things will happen:
+ * 1. Suspend current coroutine
+ * 2. Set current coroutine as continuation of this Task
+ * 3. Transfer execution to the co_awaited Task
+ */
+template <typename Promise>
+struct task_awaiter
+{
+    using handle_type = std::coroutine_handle<Promise>;
+
+  public:
+    explicit task_awaiter(handle_type coro) : coro_(coro)
+    {
+    }
+
+    bool await_ready() noexcept
+    {
+        return !coro_ || coro_.done();
+    }
+
+    auto await_suspend(std::coroutine_handle<> handle) noexcept
+    {
+        coro_.promise().setContinuation(handle);
+        return coro_;
+    }
+
+    auto await_resume()
+    {
+        if constexpr (std::is_void_v<decltype(coro_.promise().result())>)
+        {
+            coro_.promise().result();  // throw exception if any
+            return;
+        }
+        else
+        {
+            return std::move(coro_.promise().result());
+        }
+    }
+
+  private:
+    handle_type coro_;
 };
 
 template <typename T = void>
@@ -108,19 +161,24 @@ struct [[nodiscard]] Task
     Task(handle_type h) : coro_(h)
     {
     }
+
     Task(const Task &) = delete;
-    Task(Task &&other)
+
+    Task(Task &&other) noexcept
     {
         coro_ = other.coro_;
         other.coro_ = nullptr;
     }
+
     ~Task()
     {
         if (coro_)
             coro_.destroy();
     }
+
     Task &operator=(const Task &) = delete;
-    Task &operator=(Task &&other)
+
+    Task &operator=(Task &&other) noexcept
     {
         if (std::addressof(other) == this)
             return *this;
@@ -138,14 +196,17 @@ struct [[nodiscard]] Task
         {
             return Task<T>{handle_type::from_promise(*this)};
         }
+
         std::suspend_always initial_suspend()
         {
             return {};
         }
+
         void return_value(const T &v)
         {
             value = v;
         }
+
         void return_value(T &&v)
         {
             value = std::move(v);
@@ -182,76 +243,16 @@ struct [[nodiscard]] Task
             continuation_ = handle;
         }
 
-        optional<T> value;
+        std::optional<T> value;
         std::exception_ptr exception_;
-        std::coroutine_handle<> continuation_;
+        std::coroutine_handle<> continuation_{std::noop_coroutine()};
     };
-    bool await_ready() const
+
+    auto operator co_await() const noexcept
     {
-        return !coro_ || coro_.done();
-    }
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting)
-    {
-        coro_.promise().setContinuation(awaiting);
-        return coro_;
+        return task_awaiter(coro_);
     }
 
-    auto operator co_await() const &noexcept
-    {
-        struct awaiter
-        {
-          public:
-            explicit awaiter(handle_type coro) : coro_(coro)
-            {
-            }
-            bool await_ready() noexcept
-            {
-                return !coro_ || coro_.done();
-            }
-            auto await_suspend(std::coroutine_handle<> handle) noexcept
-            {
-                coro_.promise().setContinuation(handle);
-                return coro_;
-            }
-            T await_resume()
-            {
-                auto &&v = coro_.promise().result();
-                return std::move(v);
-            }
-
-          private:
-            handle_type coro_;
-        };
-        return awaiter(coro_);
-    }
-
-    auto operator co_await() const &&noexcept
-    {
-        struct awaiter
-        {
-          public:
-            explicit awaiter(handle_type coro) : coro_(coro)
-            {
-            }
-            bool await_ready() noexcept
-            {
-                return !coro_ || coro_.done();
-            }
-            auto await_suspend(std::coroutine_handle<> handle) noexcept
-            {
-                coro_.promise().setContinuation(handle);
-                return coro_;
-            }
-            T await_resume()
-            {
-                return std::move(coro_.promise().result());
-            }
-
-          private:
-            handle_type coro_;
-        };
-        return awaiter(coro_);
-    }
     handle_type coro_;
 };
 
@@ -264,19 +265,24 @@ struct [[nodiscard]] Task<void>
     Task(handle_type handle) : coro_(handle)
     {
     }
+
     Task(const Task &) = delete;
-    Task(Task &&other)
+
+    Task(Task &&other) noexcept
     {
         coro_ = other.coro_;
         other.coro_ = nullptr;
     }
+
     ~Task()
     {
         if (coro_)
             coro_.destroy();
     }
+
     Task &operator=(const Task &) = delete;
-    Task &operator=(Task &&other)
+
+    Task &operator=(Task &&other) noexcept
     {
         if (std::addressof(other) == this)
             return *this;
@@ -294,97 +300,46 @@ struct [[nodiscard]] Task<void>
         {
             return Task<>{handle_type::from_promise(*this)};
         }
+
         std::suspend_always initial_suspend()
         {
             return {};
         }
+
         void return_void()
         {
         }
+
         auto final_suspend() noexcept
         {
             return final_awaiter{};
         }
+
         void unhandled_exception()
         {
             exception_ = std::current_exception();
         }
+
         void result()
         {
             if (exception_ != nullptr)
                 std::rethrow_exception(exception_);
         }
+
         void setContinuation(std::coroutine_handle<> handle)
         {
             continuation_ = handle;
         }
+
         std::exception_ptr exception_;
-        std::coroutine_handle<> continuation_;
+        std::coroutine_handle<> continuation_{std::noop_coroutine()};
     };
-    bool await_ready()
-    {
-        return coro_.done();
-    }
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting)
-    {
-        coro_.promise().setContinuation(awaiting);
-        return coro_;
-    }
-    auto operator co_await() const &noexcept
-    {
-        struct awaiter
-        {
-          public:
-            explicit awaiter(handle_type coro) : coro_(coro)
-            {
-            }
-            bool await_ready() noexcept
-            {
-                return !coro_ || coro_.done();
-            }
-            auto await_suspend(std::coroutine_handle<> handle) noexcept
-            {
-                coro_.promise().setContinuation(handle);
-                return coro_;
-            }
-            auto await_resume()
-            {
-                coro_.promise().result();
-            }
 
-          private:
-            handle_type coro_;
-        };
-        return awaiter(coro_);
+    auto operator co_await() const noexcept
+    {
+        return task_awaiter(coro_);
     }
 
-    auto operator co_await() const &&noexcept
-    {
-        struct awaiter
-        {
-          public:
-            explicit awaiter(handle_type coro) : coro_(coro)
-            {
-            }
-            bool await_ready() noexcept
-            {
-                return false;
-            }
-            auto await_suspend(std::coroutine_handle<> handle) noexcept
-            {
-                coro_.promise().setContinuation(handle);
-                return coro_;
-            }
-            void await_resume()
-            {
-                coro_.promise().result();
-            }
-
-          private:
-            handle_type coro_;
-        };
-        return awaiter(coro_);
-    }
     handle_type coro_;
 };
 
@@ -405,8 +360,15 @@ struct AsyncTask
 
     AsyncTask(const AsyncTask &) = delete;
 
+    AsyncTask(AsyncTask &&other) noexcept
+    {
+        coro_ = other.coro_;
+        other.coro_ = nullptr;
+    }
+
     AsyncTask &operator=(const AsyncTask &) = delete;
-    AsyncTask &operator=(AsyncTask &&other)
+
+    AsyncTask &operator=(AsyncTask &&other) noexcept
     {
         if (std::addressof(other) == this)
             return *this;
@@ -418,8 +380,6 @@ struct AsyncTask
 
     struct promise_type
     {
-        std::coroutine_handle<> continuation_;
-
         AsyncTask get_return_object() noexcept
         {
             return {std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -440,48 +400,11 @@ struct AsyncTask
         {
         }
 
-        void setContinuation(std::coroutine_handle<> handle)
+        std::suspend_never final_suspend() const noexcept
         {
-            continuation_ = handle;
-        }
-
-        auto final_suspend() const noexcept
-        {
-            // Can't simply use suspend_never because we need symmetric transfer
-            struct awaiter final
-            {
-                bool await_ready() const noexcept
-                {
-                    return true;
-                }
-
-                auto await_suspend(
-                    std::coroutine_handle<promise_type> coro) const noexcept
-                {
-                    return coro.promise().continuation_;
-                }
-
-                void await_resume() const noexcept
-                {
-                }
-            };
-            return awaiter{};
+            return {};
         }
     };
-    bool await_ready() const noexcept
-    {
-        return coro_.done();
-    }
-
-    void await_resume() const noexcept
-    {
-    }
-
-    auto await_suspend(std::coroutine_handle<> coroutine) noexcept
-    {
-        coro_.promise().setContinuation(coroutine);
-        return coro_;
-    }
 
     handle_type coro_;
 };
@@ -490,7 +413,7 @@ struct AsyncTask
 /// coroutines
 // The user is responsible to fill in `await_suspend()` and constructors.
 template <typename T = void>
-struct CallbackAwaiter
+struct CallbackAwaiter : public trantor::NonCopyable
 {
     bool await_ready() noexcept
     {
@@ -513,7 +436,7 @@ struct CallbackAwaiter
     // HACK: Not all desired types are default constructable. But we need the
     // entire struct to be constructed for awaiting. std::optional takes care of
     // that.
-    optional<T> result_;
+    std::optional<T> result_;
     std::exception_ptr exception_{nullptr};
 
   protected:
@@ -521,10 +444,12 @@ struct CallbackAwaiter
     {
         exception_ = e;
     }
+
     void setValue(const T &v)
     {
         result_.emplace(v);
     }
+
     void setValue(T &&v)
     {
         result_.emplace(std::move(v));
@@ -532,7 +457,7 @@ struct CallbackAwaiter
 };
 
 template <>
-struct CallbackAwaiter<void>
+struct CallbackAwaiter<void> : public trantor::NonCopyable
 {
     bool await_ready() noexcept
     {
@@ -592,7 +517,7 @@ auto sync_wait(Await &&await)
     }
     else
     {
-        optional<value_type> value;
+        std::optional<value_type> value;
         auto task = [&]() -> AsyncTask {
             try
             {
@@ -655,10 +580,12 @@ struct [[nodiscard]] TimerAwaiter : CallbackAwaiter<void>
         : loop_(loop), delay_(delay.count())
     {
     }
+
     TimerAwaiter(trantor::EventLoop *loop, double delay)
         : loop_(loop), delay_(delay)
     {
     }
+
     void await_suspend(std::coroutine_handle<> handle)
     {
         loop_->runAfter(delay_, [handle]() { handle.resume(); });
@@ -668,6 +595,78 @@ struct [[nodiscard]] TimerAwaiter : CallbackAwaiter<void>
     trantor::EventLoop *loop_;
     double delay_;
 };
+
+struct [[nodiscard]] LoopAwaiter : CallbackAwaiter<void>
+{
+    LoopAwaiter(trantor::EventLoop *workLoop,
+                std::function<void()> &&taskFunc,
+                trantor::EventLoop *resumeLoop = nullptr)
+        : workLoop_(workLoop),
+          resumeLoop_(resumeLoop),
+          taskFunc_(std::move(taskFunc))
+    {
+        assert(workLoop);
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        workLoop_->queueInLoop([handle, this]() {
+            try
+            {
+                taskFunc_();
+                if (resumeLoop_ && resumeLoop_ != workLoop_)
+                    resumeLoop_->queueInLoop([handle]() { handle.resume(); });
+                else
+                    handle.resume();
+            }
+            catch (...)
+            {
+                setException(std::current_exception());
+                if (resumeLoop_ && resumeLoop_ != workLoop_)
+                    resumeLoop_->queueInLoop([handle]() { handle.resume(); });
+                else
+                    handle.resume();
+            }
+        });
+    }
+
+  private:
+    trantor::EventLoop *workLoop_{nullptr};
+    trantor::EventLoop *resumeLoop_{nullptr};
+    std::function<void()> taskFunc_;
+};
+
+struct [[nodiscard]] SwitchThreadAwaiter : CallbackAwaiter<void>
+{
+    explicit SwitchThreadAwaiter(trantor::EventLoop *loop) : loop_(loop)
+    {
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        loop_->runInLoop([handle]() { handle.resume(); });
+    }
+
+  private:
+    trantor::EventLoop *loop_;
+};
+
+struct [[nodiscard]] EndAwaiter : CallbackAwaiter<void>
+{
+    EndAwaiter(trantor::EventLoop *loop) : loop_(loop)
+    {
+        assert(loop);
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        loop_->runOnQuit([handle]() { handle.resume(); });
+    }
+
+  private:
+    trantor::EventLoop *loop_{nullptr};
+};
+
 }  // namespace internal
 
 inline internal::TimerAwaiter sleepCoro(
@@ -675,14 +674,36 @@ inline internal::TimerAwaiter sleepCoro(
     const std::chrono::duration<double> &delay) noexcept
 {
     assert(loop);
-    return internal::TimerAwaiter(loop, delay);
+    return {loop, delay};
 }
 
 inline internal::TimerAwaiter sleepCoro(trantor::EventLoop *loop,
                                         double delay) noexcept
 {
     assert(loop);
-    return internal::TimerAwaiter(loop, delay);
+    return {loop, delay};
+}
+
+inline internal::LoopAwaiter queueInLoopCoro(
+    trantor::EventLoop *workLoop,
+    std::function<void()> taskFunc,
+    trantor::EventLoop *resumeLoop = nullptr)
+{
+    assert(workLoop);
+    return {workLoop, std::move(taskFunc), resumeLoop};
+}
+
+inline internal::SwitchThreadAwaiter switchThreadCoro(
+    trantor::EventLoop *loop) noexcept
+{
+    assert(loop);
+    return internal::SwitchThreadAwaiter{loop};
+}
+
+inline internal::EndAwaiter untilQuit(trantor::EventLoop *loop)
+{
+    assert(loop);
+    return {loop};
 }
 
 template <typename T, typename = std::void_t<>>
@@ -728,7 +749,7 @@ void async_run(Coro &&coro)
 
 /**
  * @brief returns a function that calls a coroutine
- * @param Coro A coroutine that is awaitable
+ * @param coro A coroutine that is awaitable
  */
 template <typename Coro>
 std::function<void()> async_func(Coro &&coro)
@@ -737,5 +758,233 @@ std::function<void()> async_func(Coro &&coro)
         async_run(std::move(coro));
     };
 }
+
+namespace internal
+{
+template <typename T>
+struct [[nodiscard]] EventLoopAwaiter : public drogon::CallbackAwaiter<T>
+{
+    EventLoopAwaiter(std::function<T()> &&task, trantor::EventLoop *loop)
+        : task_(std::move(task)), loop_(loop)
+    {
+    }
+
+    void await_suspend(std::coroutine_handle<> handle)
+    {
+        loop_->queueInLoop([this, handle]() {
+            try
+            {
+                if constexpr (!std::is_same_v<T, void>)
+                {
+                    this->setValue(task_());
+                    handle.resume();
+                }
+                else
+                {
+                    task_();
+                    handle.resume();
+                }
+            }
+            catch (const std::exception &err)
+            {
+                LOG_ERROR << err.what();
+                this->setException(std::current_exception());
+                handle.resume();
+            }
+        });
+    }
+
+  private:
+    std::function<T()> task_;
+    trantor::EventLoop *loop_;
+};
+}  // namespace internal
+
+/**
+ * @brief Run a task in a given event loop and returns a resumable object that
+ * can be co_awaited in a coroutine.
+ */
+template <typename T>
+inline internal::EventLoopAwaiter<T> queueInLoopCoro(trantor::EventLoop *loop,
+                                                     std::function<T()> task)
+{
+    return internal::EventLoopAwaiter<T>(std::move(task), loop);
+}
+
+class Mutex final
+{
+    class ScopedCoroMutexAwaiter;
+    class CoroMutexAwaiter;
+
+  public:
+    Mutex() noexcept : state_(unlockedValue()), waiters_(nullptr)
+    {
+    }
+
+    Mutex(const Mutex &) = delete;
+    Mutex(Mutex &&) = delete;
+    Mutex &operator=(const Mutex &) = delete;
+    Mutex &operator=(Mutex &&) = delete;
+
+    ~Mutex()
+    {
+        [[maybe_unused]] auto state = state_.load(std::memory_order_relaxed);
+        assert(state == unlockedValue() || state == nullptr);
+        assert(waiters_ == nullptr);
+    }
+
+    bool try_lock() noexcept
+    {
+        void *oldValue = unlockedValue();
+        return state_.compare_exchange_strong(oldValue,
+                                              nullptr,
+                                              std::memory_order_acquire,
+                                              std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] ScopedCoroMutexAwaiter scoped_lock(
+        trantor::EventLoop *loop =
+            trantor::EventLoop::getEventLoopOfCurrentThread()) noexcept
+    {
+        return ScopedCoroMutexAwaiter(*this, loop);
+    }
+
+    [[nodiscard]] CoroMutexAwaiter lock(
+        trantor::EventLoop *loop =
+            trantor::EventLoop::getEventLoopOfCurrentThread()) noexcept
+    {
+        return CoroMutexAwaiter(*this, loop);
+    }
+
+    void unlock() noexcept
+    {
+        assert(state_.load(std::memory_order_relaxed) != unlockedValue());
+        auto *waitersHead = waiters_;
+        if (waitersHead == nullptr)
+        {
+            void *currentState = state_.load(std::memory_order_relaxed);
+            if (currentState == nullptr)
+            {
+                const bool releasedLock =
+                    state_.compare_exchange_strong(currentState,
+                                                   unlockedValue(),
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed);
+                if (releasedLock)
+                {
+                    return;
+                }
+            }
+            currentState = state_.exchange(nullptr, std::memory_order_acquire);
+            assert(currentState != unlockedValue());
+            assert(currentState != nullptr);
+            auto *waiter = static_cast<CoroMutexAwaiter *>(currentState);
+            do
+            {
+                auto *temp = waiter->next_;
+                waiter->next_ = waitersHead;
+                waitersHead = waiter;
+                waiter = temp;
+            } while (waiter != nullptr);
+        }
+        assert(waitersHead != nullptr);
+        waiters_ = waitersHead->next_;
+        if (waitersHead->loop_)
+        {
+            auto handle = waitersHead->handle_;
+            waitersHead->loop_->runInLoop([handle] { handle.resume(); });
+        }
+        else
+        {
+            waitersHead->handle_.resume();
+        }
+    }
+
+  private:
+    class CoroMutexAwaiter
+    {
+      public:
+        CoroMutexAwaiter(Mutex &mutex, trantor::EventLoop *loop) noexcept
+            : mutex_(mutex), loop_(loop)
+        {
+        }
+
+        bool await_ready() noexcept
+        {
+            return mutex_.try_lock();
+        }
+
+        bool await_suspend(std::coroutine_handle<> handle) noexcept
+        {
+            handle_ = handle;
+            return mutex_.asynclockImpl(this);
+        }
+
+        void await_resume() noexcept
+        {
+        }
+
+      private:
+        friend class Mutex;
+
+        Mutex &mutex_;
+        trantor::EventLoop *loop_;
+        std::coroutine_handle<> handle_;
+        CoroMutexAwaiter *next_;
+    };
+
+    class ScopedCoroMutexAwaiter : public CoroMutexAwaiter
+    {
+      public:
+        ScopedCoroMutexAwaiter(Mutex &mutex, trantor::EventLoop *loop)
+            : CoroMutexAwaiter(mutex, loop)
+        {
+        }
+
+        [[nodiscard]] auto await_resume() noexcept
+        {
+            return std::unique_lock<Mutex>{mutex_, std::adopt_lock};
+        }
+    };
+
+    bool asynclockImpl(CoroMutexAwaiter *awaiter)
+    {
+        void *oldValue = state_.load(std::memory_order_relaxed);
+        while (true)
+        {
+            if (oldValue == unlockedValue())
+            {
+                void *newValue = nullptr;
+                if (state_.compare_exchange_weak(oldValue,
+                                                 newValue,
+                                                 std::memory_order_acquire,
+                                                 std::memory_order_relaxed))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                void *newValue = awaiter;
+                awaiter->next_ = static_cast<CoroMutexAwaiter *>(oldValue);
+                if (state_.compare_exchange_weak(oldValue,
+                                                 newValue,
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    void *unlockedValue() noexcept
+    {
+        return this;
+    }
+
+    std::atomic<void *> state_;
+    CoroMutexAwaiter *waiters_;
+};
 
 }  // namespace drogon

@@ -14,16 +14,19 @@
 
 #pragma once
 
-#include "impl_forwards.h"
-#include <drogon/HttpClient.h>
 #include <drogon/Cookie.h>
+#include <drogon/HttpClient.h>
 #include <trantor/net/EventLoop.h>
-#include <trantor/net/TcpClient.h>
 #include <trantor/net/Resolver.h>
+#include <trantor/net/TcpClient.h>
+#include <cstddef>
+#include <functional>
+#include <future>
+#include <list>
 #include <mutex>
 #include <queue>
-#include <list>
 #include <vector>
+#include "impl_forwards.h"
 
 namespace drogon
 {
@@ -46,14 +49,17 @@ class HttpClientImpl final : public HttpClient,
     void sendRequest(const HttpRequestPtr &req,
                      HttpReqCallback &&callback,
                      double timeout = 0) override;
+
     trantor::EventLoop *getLoop() override
     {
         return loop_;
     }
+
     void setPipeliningDepth(size_t depth) override
     {
         pipeliningDepth_ = depth;
     }
+
     ~HttpClientImpl();
 
     void enableCookies(bool flag = true) override
@@ -75,10 +81,12 @@ class HttpClientImpl final : public HttpClient,
     {
         return bytesSent_;
     }
+
     size_t bytesReceived() const override
     {
         return bytesReceived_;
     }
+
     void setUserAgent(const std::string &userAgent) override
     {
         userAgent_ = userAgent;
@@ -105,6 +113,26 @@ class HttpClientImpl final : public HttpClient,
     void addSSLConfigs(const std::vector<std::pair<std::string, std::string>>
                            &sslConfCmds) override;
 
+    void setSockOptCallback(std::function<void(int)> cb) override
+    {
+        sockOptCallback_ = std::move(cb);
+    }
+
+    std::size_t requestsBufferSize() override
+    {
+        if (loop_->isInLoopThread())
+        {
+            return requestsBuffer_.size();
+        }
+        else
+        {
+            std::promise<std::size_t> bufferSize;
+            loop_->queueInLoop(
+                [&] { bufferSize.set_value(requestsBuffer_.size()); });
+            return bufferSize.get_future().get();
+        }
+    }
+
   private:
     std::shared_ptr<trantor::TcpClient> tcpClientPtr_;
     trantor::EventLoop *loop_;
@@ -128,6 +156,7 @@ class HttpClientImpl final : public HttpClient,
     void onRecvMessage(const trantor::TcpConnectionPtr &, trantor::MsgBuffer *);
     void onError(ReqResult result);
     std::string domain_;
+    bool isDomainName_{true};  // true if domain_ is name
     size_t pipeliningDepth_{0};
     bool enableCookies_{false};
     std::vector<Cookie> validCookies_;
@@ -140,6 +169,8 @@ class HttpClientImpl final : public HttpClient,
     std::vector<std::pair<std::string, std::string>> sslConfCmds_;
     std::string clientCertPath_;
     std::string clientKeyPath_;
+    std::function<void(int)> sockOptCallback_;
 };
+
 using HttpClientImplPtr = std::shared_ptr<HttpClientImpl>;
 }  // namespace drogon

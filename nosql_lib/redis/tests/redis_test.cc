@@ -9,6 +9,7 @@ using namespace std::chrono_literals;
 using namespace drogon::nosql;
 
 RedisClientPtr redisClient;
+
 DROGON_TEST(RedisTest)
 {
     redisClient = drogon::nosql::RedisClient::newRedisClient(
@@ -41,7 +42,7 @@ DROGON_TEST(RedisTest)
             MANDATE(r.asArray().size() == 1UL);
         },
         [TEST_CTX](const std::exception &err) { MANDATE(err.what()); },
-        "keys *");
+        "keys id_*");
     // 5
     redisClient->execCommandAsync(
         [TEST_CTX](const drogon::nosql::RedisResult &r) {
@@ -80,6 +81,106 @@ DROGON_TEST(RedisTest)
     };
     drogon::sync_wait(coro_test());
 #endif
+
+    // 9. Test sync
+    try
+    {
+        auto res = redisClient->execCommandSync<std::string>(
+            [](const RedisResult &result) { return result.asString(); },
+            "set %s %s",
+            "sync_key",
+            "sync_value");
+        MANDATE(res == "OK");
+    }
+    catch (const RedisException &err)
+    {
+        MANDATE(err.what());
+    }
+
+    try
+    {
+        auto [isNull, str] =
+            redisClient->execCommandSync<std::pair<bool, std::string>>(
+                [](const RedisResult &result) -> std::pair<bool, std::string> {
+                    if (result.isNil())
+                    {
+                        return {true, ""};
+                    }
+                    return {false, result.asString()};
+                },
+                "get %s",
+                "sync_key");
+        MANDATE(isNull == false);
+        MANDATE(str == "sync_value");
+    }
+    catch (const RedisException &err)
+    {
+        MANDATE(err.what());
+    }
+
+    // 10. Test sync redis exception
+    try
+    {
+        auto [isNull, str] =
+            redisClient->execCommandSync<std::pair<bool, std::string>>(
+                [](const RedisResult &result) -> std::pair<bool, std::string> {
+                    if (result.isNil())
+                    {
+                        return {true, ""};
+                    }
+                    return {false, result.asString()};
+                },
+                "get %s %s",
+                "sync_key",
+                "sync_key");
+        MANDATE(false);
+    }
+    catch (const RedisException &err)
+    {
+        LOG_INFO << "Successfully catch sync error: " << err.what();
+        MANDATE(err.code() == RedisErrorCode::kRedisError);
+        SUCCESS();
+    }
+
+    // 11. Test sync process function exception
+    try
+    {
+        auto value = redisClient->execCommandSync<std::string>(
+            [](const RedisResult &result) {
+                if (result.isNil())
+                {
+                    throw std::runtime_error("Key not exists");
+                }
+                return result.asString();
+            },
+            "get %s",
+            "not_exists");
+        MANDATE(false);
+    }
+    catch (const RedisException &err)
+    {
+        (void)err;
+        MANDATE(false);
+    }
+    catch (const std::runtime_error &err)
+    {
+        MANDATE(std::string("Key not exists") == err.what());
+        SUCCESS();
+    }
+
+    // 12. Test omit template parameter
+    try
+    {
+        auto i = redisClient->execCommandSync(
+            [](const RedisResult &r) { return r.asInteger(); },
+            "del %s",
+            "sync_key");
+        MANDATE(i == 1);
+    }
+    catch (const RedisException &err)
+    {
+        MANDATE(err.what());
+    }
 }
 
 int main(int argc, char **argv)

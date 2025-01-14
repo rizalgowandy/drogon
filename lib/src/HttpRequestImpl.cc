@@ -23,7 +23,13 @@
 #include <unistd.h>
 #endif
 
+#include <zlib.h>
+#ifdef USE_BROTLI
+#include <brotli/decode.h>
+#endif
+
 using namespace drogon;
+
 void HttpRequestImpl::parseJson() const
 {
     auto input = contentView();
@@ -35,7 +41,11 @@ void HttpRequestImpl::parseJson() const
     {
         static std::once_flag once;
         static Json::CharReaderBuilder builder;
-        std::call_once(once, []() { builder["collectComments"] = false; });
+        std::call_once(once, []() {
+            builder["collectComments"] = false;
+            builder["stackLimit"] = static_cast<Json::UInt>(
+                drogon::app().getJsonParserStackLimit());
+        });
         jsonPtr_ = std::make_shared<Json::Value>();
         JSONCPP_STRING errs;
         std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
@@ -44,7 +54,7 @@ void HttpRequestImpl::parseJson() const
                            jsonPtr_.get(),
                            &errs))
         {
-            LOG_ERROR << errs;
+            LOG_DEBUG << errs;
             jsonPtr_.reset();
             jsonParsingErrorPtr_ =
                 std::make_unique<std::string>(std::move(errs));
@@ -61,51 +71,59 @@ void HttpRequestImpl::parseJson() const
             std::make_unique<std::string>("content type error");
     }
 }
+
 void HttpRequestImpl::parseParameters() const
 {
     auto input = queryView();
     if (!input.empty())
     {
-        string_view::size_type pos = 0;
-        while ((input[pos] == '?' || isspace(input[pos])) &&
+        std::string_view::size_type pos = 0;
+        while ((input[pos] == '?' ||
+                isspace(static_cast<unsigned char>(input[pos]))) &&
                pos < input.length())
         {
             ++pos;
         }
         auto value = input.substr(pos);
-        while ((pos = value.find('&')) != string_view::npos)
+        while ((pos = value.find('&')) != std::string_view::npos)
         {
             auto coo = value.substr(0, pos);
             auto epos = coo.find('=');
-            if (epos != string_view::npos)
+            if (epos != std::string_view::npos)
             {
                 auto key = coo.substr(0, epos);
-                string_view::size_type cpos = 0;
-                while (cpos < key.length() && isspace(key[cpos]))
+                std::string_view::size_type cpos = 0;
+                while (cpos < key.length() &&
+                       isspace(static_cast<unsigned char>(key[cpos])))
                     ++cpos;
-                key = key.substr(cpos);
+                key.remove_prefix(cpos);
                 auto pvalue = coo.substr(epos + 1);
-                std::string pdecode = utils::urlDecode(pvalue);
-                std::string keydecode = utils::urlDecode(key);
-                parameters_[keydecode] = pdecode;
+                parameters_[utils::urlDecode(key)] = utils::urlDecode(pvalue);
             }
-            value = value.substr(pos + 1);
+            else
+            {
+                parameters_[utils::urlDecode(coo)];
+            }
+            value.remove_prefix(pos + 1);
         }
         if (value.length() > 0)
         {
             auto &coo = value;
             auto epos = coo.find('=');
-            if (epos != string_view::npos)
+            if (epos != std::string_view::npos)
             {
                 auto key = coo.substr(0, epos);
-                string_view::size_type cpos = 0;
-                while (cpos < key.length() && isspace(key[cpos]))
+                std::string_view::size_type cpos = 0;
+                while (cpos < key.length() &&
+                       isspace(static_cast<unsigned char>(key[cpos])))
                     ++cpos;
-                key = key.substr(cpos);
+                key.remove_prefix(cpos);
                 auto pvalue = coo.substr(epos + 1);
-                std::string pdecode = utils::urlDecode(pvalue);
-                std::string keydecode = utils::urlDecode(key);
-                parameters_[keydecode] = pdecode;
+                parameters_[utils::urlDecode(key)] = utils::urlDecode(pvalue);
+            }
+            else
+            {
+                parameters_[utils::urlDecode(coo)];
             }
         }
     }
@@ -114,50 +132,59 @@ void HttpRequestImpl::parseParameters() const
     if (input.empty())
         return;
     std::string type = getHeaderBy("content-type");
-    std::transform(type.begin(), type.end(), type.begin(), tolower);
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+        return tolower(c);
+    });
     if (type.empty() ||
         type.find("application/x-www-form-urlencoded") != std::string::npos)
     {
-        string_view::size_type pos = 0;
-        while ((input[pos] == '?' || isspace(input[pos])) &&
+        std::string_view::size_type pos = 0;
+        while ((input[pos] == '?' ||
+                isspace(static_cast<unsigned char>(input[pos]))) &&
                pos < input.length())
         {
             ++pos;
         }
         auto value = input.substr(pos);
-        while ((pos = value.find('&')) != string_view::npos)
+        while ((pos = value.find('&')) != std::string_view::npos)
         {
             auto coo = value.substr(0, pos);
             auto epos = coo.find('=');
-            if (epos != string_view::npos)
+            if (epos != std::string_view::npos)
             {
                 auto key = coo.substr(0, epos);
-                string_view::size_type cpos = 0;
-                while (cpos < key.length() && isspace(key[cpos]))
+                std::string_view::size_type cpos = 0;
+                while (cpos < key.length() &&
+                       isspace(static_cast<unsigned char>(key[cpos])))
                     ++cpos;
-                key = key.substr(cpos);
+                key.remove_prefix(cpos);
                 auto pvalue = coo.substr(epos + 1);
-                std::string pdecode = utils::urlDecode(pvalue);
-                std::string keydecode = utils::urlDecode(key);
-                parameters_[keydecode] = pdecode;
+                parameters_[utils::urlDecode(key)] = utils::urlDecode(pvalue);
             }
-            value = value.substr(pos + 1);
+            else
+            {
+                parameters_[utils::urlDecode(coo)];
+            }
+            value.remove_prefix(pos + 1);
         }
         if (value.length() > 0)
         {
             auto &coo = value;
             auto epos = coo.find('=');
-            if (epos != string_view::npos)
+            if (epos != std::string_view::npos)
             {
                 auto key = coo.substr(0, epos);
-                string_view::size_type cpos = 0;
-                while (cpos < key.length() && isspace(key[cpos]))
+                std::string_view::size_type cpos = 0;
+                while (cpos < key.length() &&
+                       isspace(static_cast<unsigned char>(key[cpos])))
                     ++cpos;
-                key = key.substr(cpos);
+                key.remove_prefix(cpos);
                 auto pvalue = coo.substr(epos + 1);
-                std::string pdecode = utils::urlDecode(pvalue);
-                std::string keydecode = utils::urlDecode(key);
-                parameters_[keydecode] = pdecode;
+                parameters_[utils::urlDecode(key)] = utils::urlDecode(pvalue);
+            }
+            else
+            {
+                parameters_[utils::urlDecode(coo)];
             }
         }
     }
@@ -286,7 +313,16 @@ void HttpRequestImpl::appendToBuffer(trantor::MsgBuffer *output) const
                 content.append(file.itemName());
                 content.append("\"; filename=\"");
                 content.append(file.fileName());
-                content.append("\"\r\n\r\n");
+                content.append("\"");
+                if (file.contentType() != CT_NONE)
+                {
+                    content.append("\r\n");
+
+                    auto &type = contentTypeToMime(file.contentType());
+                    content.append("content-type: ");
+                    content.append(type.data(), type.length());
+                }
+                content.append("\r\n\r\n");
                 std::ifstream infile(utils::toNativePath(file.path()),
                                      std::ifstream::binary);
                 if (!infile)
@@ -376,14 +412,18 @@ void HttpRequestImpl::addHeader(const char *start,
 {
     std::string field(start, colon);
     // Field name is case-insensitive.so we transform it to lower;(rfc2616-4.2)
-    std::transform(field.begin(), field.end(), field.begin(), ::tolower);
+    std::transform(field.begin(),
+                   field.end(),
+                   field.begin(),
+                   [](unsigned char c) { return tolower(c); });
     ++colon;
-    while (colon < end && isspace(*colon))
+    while (colon < end && isspace(static_cast<unsigned char>(*colon)))
     {
         ++colon;
     }
     std::string value(colon, end);
-    while (!value.empty() && isspace(value[value.size() - 1]))
+    while (!value.empty() &&
+           isspace(static_cast<unsigned char>(value[value.size() - 1])))
     {
         value.resize(value.size() - 1);
     }
@@ -400,13 +440,13 @@ void HttpRequestImpl::addHeader(const char *start,
                 std::string cookie_name = coo.substr(0, epos);
                 std::string::size_type cpos = 0;
                 while (cpos < cookie_name.length() &&
-                       isspace(cookie_name[cpos]))
+                       isspace(static_cast<unsigned char>(cookie_name[cpos])))
                     ++cpos;
                 cookie_name = cookie_name.substr(cpos);
                 std::string cookie_value = coo.substr(epos + 1);
                 cpos = 0;
                 while (cpos < cookie_value.length() &&
-                       isspace(cookie_value[cpos]))
+                       isspace(static_cast<unsigned char>(cookie_value[cpos])))
                     ++cpos;
                 cookie_value = cookie_value.substr(cpos);
                 cookies_[std::move(cookie_name)] = std::move(cookie_value);
@@ -422,13 +462,13 @@ void HttpRequestImpl::addHeader(const char *start,
                 std::string cookie_name = coo.substr(0, epos);
                 std::string::size_type cpos = 0;
                 while (cpos < cookie_name.length() &&
-                       isspace(cookie_name[cpos]))
+                       isspace(static_cast<unsigned char>(cookie_name[cpos])))
                     ++cpos;
                 cookie_name = cookie_name.substr(cpos);
                 std::string cookie_value = coo.substr(epos + 1);
                 cpos = 0;
                 while (cpos < cookie_value.length() &&
-                       isspace(cookie_value[cpos]))
+                       isspace(static_cast<unsigned char>(cookie_value[cpos])))
                     ++cpos;
                 cookie_value = cookie_value.substr(cpos);
                 cookies_[std::move(cookie_name)] = std::move(cookie_value);
@@ -530,10 +570,13 @@ void HttpRequestImpl::swap(HttpRequestImpl &that) noexcept
     swap(flagForParsingParameters_, that.flagForParsingParameters_);
     swap(matchedPathPattern_, that.matchedPathPattern_);
     swap(path_, that.path_);
+    swap(originalPath_, that.originalPath_);
     swap(pathEncode_, that.pathEncode_);
     swap(query_, that.query_);
     swap(headers_, that.headers_);
     swap(cookies_, that.cookies_);
+    swap(contentLengthHeaderValue_, that.contentLengthHeaderValue_);
+    swap(realContentLength_, that.realContentLength_);
     swap(parameters_, that.parameters_);
     swap(jsonPtr_, that.jsonPtr_);
     swap(sessionPtr_, that.sessionPtr_);
@@ -550,6 +593,14 @@ void HttpRequestImpl::swap(HttpRequestImpl &that) noexcept
     swap(loop_, that.loop_);
     swap(flagForParsingContentType_, that.flagForParsingContentType_);
     swap(jsonParsingErrorPtr_, that.jsonParsingErrorPtr_);
+    swap(routingParams_, that.routingParams_);
+    // stream
+    swap(streamStatus_, that.streamStatus_);
+    swap(streamReaderPtr_, that.streamReaderPtr_);
+    swap(streamFinishCb_, that.streamFinishCb_);
+    swap(streamExceptionPtr_, that.streamExceptionPtr_);
+    swap(startProcessing_, that.startProcessing_);
+    swap(connPtr_, that.connPtr_);
 }
 
 const char *HttpRequestImpl::versionString() const
@@ -606,7 +657,7 @@ const char *HttpRequestImpl::methodString() const
 bool HttpRequestImpl::setMethod(const char *start, const char *end)
 {
     assert(method_ == Invalid);
-    string_view m(start, end - start);
+    std::string_view m(start, end - start);
     switch (m.length())
     {
         case 3:
@@ -689,20 +740,32 @@ HttpRequestImpl::~HttpRequestImpl()
 
 void HttpRequestImpl::reserveBodySize(size_t length)
 {
+    assert(loop_->isInLoopThread());
+    if (cacheFilePtr_)
+    {
+        return;
+    }
     if (length <= HttpAppFrameworkImpl::instance().getClientMaxMemoryBodySize())
     {
         content_.reserve(length);
     }
     else
     {
-        // Store data of body to a temperary file
+        // Store data of body to a temporary file
         createTmpFile();
     }
 }
 
 void HttpRequestImpl::appendToBody(const char *data, size_t length)
 {
-    if (cacheFilePtr_)
+    assert(loop_->isInLoopThread());
+    realContentLength_ += length;
+    if (streamReaderPtr_)
+    {
+        assert(streamStatus_ == ReqStreamStatus::Open);
+        streamReaderPtr_->onStreamData(data, length);
+    }
+    else if (cacheFilePtr_)
     {
         cacheFilePtr_->append(data, length);
     }
@@ -726,7 +789,7 @@ void HttpRequestImpl::appendToBody(const char *data, size_t length)
 void HttpRequestImpl::createTmpFile()
 {
     auto tmpfile = HttpAppFrameworkImpl::instance().getUploadPath();
-    auto fileName = utils::getUuid();
+    auto fileName = utils::getUuid(false);
     tmpfile.append("/tmp/")
         .append(1, fileName[0])
         .append(1, fileName[1])
@@ -745,4 +808,309 @@ void HttpRequestImpl::setContentTypeString(const char *typeString,
     contentType_ = contentType;
     contentTypeString_ = std::string(sv);
     flagForParsingContentType_ = true;
+}
+
+StreamDecompressStatus HttpRequestImpl::decompressBody()
+{
+    auto &contentEncoding = getHeaderBy("content-encoding");
+    if (contentEncoding.empty() || contentEncoding == "identity")
+    {
+        removeHeaderBy("content-encoding");
+        return StreamDecompressStatus::Ok;
+    }
+#ifdef USE_BROTLI
+    else if (contentEncoding == "br")
+    {
+        removeHeaderBy("content-encoding");
+        return decompressBodyBrotli();
+    }
+#endif
+    else if (contentEncoding == "gzip")
+    {
+        removeHeaderBy("content-encoding");
+        return decompressBodyGzip();
+    }
+    return StreamDecompressStatus::NotSupported;
+}
+
+#ifdef USE_BROTLI
+StreamDecompressStatus HttpRequestImpl::decompressBodyBrotli() noexcept
+{
+    // Workaround for Windows min and max are macros
+    auto minVal = [](size_t a, size_t b) { return a < b ? a : b; };
+    std::unique_ptr<CacheFile> cacheFileHolder;
+    std::string contentHolder;
+    std::string_view compressed;
+    if (cacheFilePtr_)
+    {
+        cacheFileHolder = std::move(cacheFilePtr_);
+        compressed = cacheFileHolder->getStringView();
+    }
+    else
+    {
+        contentHolder = std::move(content_);
+        compressed = contentHolder;
+    }
+
+    setBody("");
+    const size_t maxBodySize =
+        HttpAppFrameworkImpl::instance().getClientMaxBodySize();
+    const size_t maxMemorySize =
+        HttpAppFrameworkImpl::instance().getClientMaxMemoryBodySize();
+
+    size_t availableIn = compressed.size();
+    auto nextIn = (const uint8_t *)(compressed.data());
+    auto decompressed = std::string(minVal(maxMemorySize, availableIn * 3), 0);
+    auto nextOut = (uint8_t *)(decompressed.data());
+    size_t totalOut{0};
+    auto s = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+    size_t lastOut = 0;
+    StreamDecompressStatus status = StreamDecompressStatus::Ok;
+    while (true)
+    {
+        uint8_t *outPtr = (uint8_t *)decompressed.data();
+        size_t availableOut = decompressed.size();
+        auto result = BrotliDecoderDecompressStream(
+            s, &availableIn, &nextIn, &availableOut, &outPtr, &totalOut);
+        size_t outSize = totalOut - lastOut;
+        lastOut = totalOut;
+
+        if (totalOut > maxBodySize)
+        {
+            setBody("");
+            status = StreamDecompressStatus::TooLarge;
+            break;
+        }
+
+        if (result == BROTLI_DECODER_RESULT_SUCCESS)
+        {
+            appendToBody(decompressed.data(), outSize);
+            break;
+        }
+        else if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT)
+        {
+            appendToBody(decompressed.data(), outSize);
+            size_t currentSize = decompressed.size();
+            decompressed.clear();
+            decompressed.resize(minVal(currentSize * 2, maxMemorySize));
+        }
+        else
+        {
+            setBody("");
+            status = StreamDecompressStatus::DecompressError;
+            break;
+        }
+    }
+    BrotliDecoderDestroyInstance(s);
+    return StreamDecompressStatus::Ok;
+}
+#endif
+
+StreamDecompressStatus HttpRequestImpl::decompressBodyGzip() noexcept
+{
+    // Workaround for Windows min and max are macros
+    auto minVal = [](size_t a, size_t b) { return a < b ? a : b; };
+    std::unique_ptr<CacheFile> cacheFileHolder;
+    std::string contentHolder;
+    std::string_view compressed;
+    if (cacheFilePtr_)
+    {
+        cacheFileHolder = std::move(cacheFilePtr_);
+        compressed = cacheFileHolder->getStringView();
+    }
+    else
+    {
+        contentHolder = std::move(content_);
+        compressed = contentHolder;
+    }
+
+    z_stream strm = {nullptr,
+                     0,
+                     0,
+                     nullptr,
+                     0,
+                     0,
+                     nullptr,
+                     nullptr,
+                     nullptr,
+                     nullptr,
+                     nullptr,
+                     0,
+                     0,
+                     0};
+    strm.next_in = (Bytef *)compressed.data();
+    strm.avail_in = static_cast<uInt>(compressed.size());
+    strm.total_out = 0;
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    setBody("");
+    const size_t maxBodySize =
+        HttpAppFrameworkImpl::instance().getClientMaxBodySize();
+    const size_t maxMemorySize =
+        HttpAppFrameworkImpl::instance().getClientMaxMemoryBodySize();
+    auto decompressed =
+        std::string(minVal(compressed.size() * 2, maxMemorySize), 0);
+    strm.next_out = (Bytef *)decompressed.data();
+    strm.avail_out = static_cast<uInt>(decompressed.size());
+    size_t lastOut = 0;
+    if (inflateInit2(&strm, (15 + 32)) != Z_OK)
+    {
+        return StreamDecompressStatus::DecompressError;
+    }
+
+    StreamDecompressStatus status = StreamDecompressStatus::Ok;
+    while (true)
+    {
+        // Inflate another chunk.
+        int decompressStatus = inflate(&strm, Z_SYNC_FLUSH);
+
+        if (strm.total_out > maxBodySize)
+        {
+            setBody("");
+            status = StreamDecompressStatus::TooLarge;
+            break;
+        }
+
+        size_t outSize = strm.total_out - lastOut;
+        lastOut = strm.total_out;
+        if (decompressStatus == Z_STREAM_END)
+        {
+            appendToBody(decompressed.data(), outSize);
+            break;
+        }
+        else if (decompressStatus != Z_OK)
+        {
+            setBody("");
+            status = StreamDecompressStatus::DecompressError;
+            break;
+        }
+        else
+        {
+            appendToBody(decompressed.data(), outSize);
+            size_t currentSize = decompressed.size();
+            decompressed.clear();
+            decompressed.resize(minVal(currentSize * 2, maxMemorySize));
+            strm.next_out = (Bytef *)decompressed.data();
+            strm.avail_out = static_cast<uInt>(decompressed.size());
+        }
+    }
+    if (inflateEnd(&strm) != Z_OK)
+    {
+        setBody("");
+        if (status == StreamDecompressStatus::Ok)
+            status = StreamDecompressStatus::DecompressError;
+        return status;
+    }
+    return status;
+}
+
+void HttpRequestImpl::setStreamReader(RequestStreamReaderPtr reader)
+{
+    assert(loop_->isInLoopThread());
+    assert(!streamReaderPtr_);
+    assert(streamStatus_ > ReqStreamStatus::None);
+
+    if (streamExceptionPtr_)
+    {
+        assert(streamStatus_ == ReqStreamStatus::Error);
+        reader->onStreamFinish(std::move(streamExceptionPtr_));
+        streamExceptionPtr_ = nullptr;
+        return;
+    }
+
+    // Consume already received body
+    if (cacheFilePtr_)
+    {
+        auto bodyPieceView = cacheFilePtr_->getStringView();
+        if (!bodyPieceView.empty())
+            reader->onStreamData(bodyPieceView.data(), bodyPieceView.length());
+        cacheFilePtr_.reset();
+    }
+    else if (!content_.empty())
+    {
+        reader->onStreamData(content_.data(), content_.length());
+        content_.clear();
+    }
+    if (streamStatus_ == ReqStreamStatus::Finish)
+    {
+        reader->onStreamFinish({});
+    }
+    else
+    {
+        streamReaderPtr_ = std::move(reader);
+    }
+}
+
+void HttpRequestImpl::streamStart()
+{
+    assert(streamStatus_ == ReqStreamStatus::None);
+    streamStatus_ = ReqStreamStatus::Open;
+}
+
+void HttpRequestImpl::streamFinish()
+{
+    assert(loop_->isInLoopThread());
+    assert(streamStatus_ == ReqStreamStatus::Open);
+    streamStatus_ = ReqStreamStatus::Finish;
+    if (streamFinishCb_)
+    {
+        auto cb = std::move(streamFinishCb_);
+        streamFinishCb_ = nullptr;
+        cb();
+    }
+    if (streamReaderPtr_)
+    {
+        streamReaderPtr_->onStreamFinish({});
+        streamReaderPtr_ = nullptr;
+    }
+}
+
+void HttpRequestImpl::streamError(std::exception_ptr ex)
+{
+    // TODO: can we be sure that streamError() only be called once?
+    // If not, we could allow it to be called multiple times, and
+    // only handle the first one.
+    assert(loop_->isInLoopThread());
+    assert(streamStatus_ == ReqStreamStatus::Open);
+    streamStatus_ = ReqStreamStatus::Error;
+    if (streamReaderPtr_)
+    {
+        streamReaderPtr_->onStreamFinish(std::move(ex));
+        streamReaderPtr_ = nullptr;
+    }
+    else
+    {
+        streamExceptionPtr_ = std::move(ex);
+    }
+
+    if (streamFinishCb_)
+    {
+        auto cb = std::move(streamFinishCb_);
+        streamFinishCb_ = nullptr;
+        cb();
+    }
+}
+
+void HttpRequestImpl::waitForStreamFinish(std::function<void()> &&cb)
+{
+    assert(loop_->isInLoopThread());
+    assert(streamStatus_ > ReqStreamStatus::None);
+
+    if (streamStatus_ <= ReqStreamStatus::Open)
+    {
+        assert(!streamFinishCb_);  // should only be called once
+        streamFinishCb_ = std::move(cb);
+    }
+    else
+    {
+        cb();
+    }
+}
+
+void HttpRequestImpl::quitStreamMode()
+{
+    assert(loop_->isInLoopThread());
+    assert(streamStatus_ >= ReqStreamStatus::Finish);
+    assert(!streamReaderPtr_);
+    streamStatus_ = ReqStreamStatus::None;
 }
